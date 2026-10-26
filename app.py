@@ -894,6 +894,6 @@ else:
     with col_a:
         st.download_button("📥 Baixar relatório Excel", data=make_excel(visible), file_name=f"Relatorio_AgroSmart_{datetime.now():%Y%m%d_%H%M}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary", use_container_width=True)
     with col_b:
-        st.download_button("📄 Baixar layout Domínio (.txt)", data=make_domain_txt(visible), file_name=f"Importacao_Dominio_{datetime.now():%Y%m%d_%H%M}.txt", mime="text/plain", use_container_width=True)
+        st.download_button("📄 Baixar arquivo TXT (formato AgroSmart)", data=make_domain_txt(visible), file_name=f"Exportacao_AgroSmart_{datetime.now():%Y%m%d_%H%M}.txt", mime="text/plain", use_container_width=True)
 
 st.caption("Importante: a extração automática pode errar. Confira os dados nos documentos originais antes de usar para decisões fiscais, sanitárias ou ambientais.")
