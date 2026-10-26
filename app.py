@@ -211,7 +211,7 @@ def format_doc_summary(item):
     return raw.get("numero_car", ""), f"{raw.get('area_hectares', '')} ha".strip()
 
 
-def make_excel(records):
+
     wb = Workbook()
     ws = wb.active
     ws.title = "AgroSmart"
@@ -223,39 +223,89 @@ def make_excel(records):
     ws.append(headers)
     header_fill = PatternFill("solid", fgColor="1B4332")
     header_font = Font(bold=True, color="FFFFFF")
+    thin = Side(style=
+def make_excel(records):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "AgroSmart"
+
+    headers = [
+        "Arquivo",
+        "Data/Hora",
+        "Produtor / Fazenda",
+        "CPF/CNPJ",
+        "Tipo Documento",
+        "Identificador",
+        "Detalhes",
+        "Status",
+        "Dados extraídos (JSON)",
+    ]
+    ws.append(headers)
+
+    header_fill = PatternFill("solid", fgColor="1B4332")
+    header_font = Font(bold=True, color="FFFFFF")
     thin = Side(style="thin", color="D3D3D3")
+
     for cell in ws[1]:
         cell.fill = header_fill
         cell.font = header_font
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+        cell.alignment = Alignment(
+            horizontal="center",
+            vertical="center",
+            wrap_text=True,
+        )
+        cell.border = Border(
+            left=thin,
+            right=thin,
+            top=thin,
+            bottom=thin,
+        )
 
     for item in records:
         ident, detail = format_doc_summary(item)
-               ws.append([
+        raw = item.get("RawData") or {}
+
+        ws.append([
             item.get("NomeFicheiro", ""),
             item.get("Data/Hora", ""),
             item.get("ProdutorIdentificado", ""),
-            (item.get("RawData") or {}).get("emitente_cpf_cnpj", ""),
+            raw.get("emitente_cpf_cnpj", ""),
             item.get("Tipo Documento", ""),
             ident or "",
             detail or "",
             item.get("StatusAuditoria", ""),
-            json.dumps(item.get("RawData", {}), ensure_ascii=False),
+            json.dumps(raw, ensure_ascii=False),
         ])
+
     for row in ws.iter_rows(min_row=2):
         for cell in row:
-            cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
-        widths = [28, 20, 32, 22, 34, 22, 26, 42, 70]
+            cell.border = Border(
+                left=thin,
+                right=thin,
+                top=thin,
+                bottom=thin,
+            )
+            cell.alignment = Alignment(
+                vertical="top",
+                wrap_text=True,
+            )
+
+    widths = [28, 20, 32, 22, 34, 22, 26, 42, 70]
+
     for index, width in enumerate(widths, start=1):
-        ws.column_dimensions[chr(64 + index)].width = width
+        ws.column_dimensions[
+            ws.cell(row=1, column=index).column_letter
+        ].width = width
+
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
+
     output = io.BytesIO()
     wb.save(output)
     output.seek(0)
+
     return output.getvalue()
+
 
 
 def make_domain_txt(records):
