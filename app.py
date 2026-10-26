@@ -2,6 +2,8 @@ import io
 import json
 import re
 import time
+import xml.etree.ElementTree as ET
+from decimal import Decimal, InvalidOperation
 from datetime import datetime
 
 import pandas as pd
@@ -83,6 +85,87 @@ def extract_pdf_text(file_bytes):
         return ""
 
 
+def _xml_child(parent, name):
+    """Return a direct XML child by local tag name, ignoring namespaces."""
+    if parent is None:
+        return None
+    for child in list(parent):
+        if child.tag.rsplit("}", 1)[-1] == name:
+            return child
+    return None
+
+
+def _xml_text(parent, name):
+    child = _xml_child(parent, name)
+    return (child.text or "").strip() if child is not None and child.text else ""
+
+
+def _format_brazilian_money(value):
+    if not value:
+        return ""
+    try:
+        amount = Decimal(value)
+        return f"{amount:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    except (InvalidOperation, ValueError):
+        return value
+
+
+def extract_fields_from_xml(file_bytes, doc_type):
+    """Extract basic fields from standard NF-e/NFC-e XML containing infNFe.
+
+    This is a first-stage reader, not an official schema validator and not a
+    generator of XML for import. GTA/CAR XML layouts are not handled here.
+    """
+    if doc_type != "nota":
+        return None, "Nesta primeira versão, a leitura de XML está disponível somente para notas fiscais. Para GTA ou CAR, use PDF, PNG ou JPG."
+
+    try:
+        root = ET.fromstring(file_bytes)
+    except ET.ParseError:
+        return None, "O arquivo não é um XML válido ou está incompleto."
+
+    inf_nfe = next(
+        (element for element in root.iter() if element.tag.rsplit("}", 1)[-1] == "infNFe"),
+        None,
+    )
+    if inf_nfe is None:
+        return None, "Não encontrei o elemento infNFe. Este arquivo pode não ser um XML padrão de NF-e/NFC-e compatível com esta primeira versão."
+
+    ide = _xml_child(inf_nfe, "ide")
+    emit = _xml_child(inf_nfe, "emit")
+    dest = _xml_child(inf_nfe, "dest")
+    total = _xml_child(inf_nfe, "total")
+    icms_total = _xml_child(total, "ICMSTot")
+
+    emit_cnpj = _xml_text(emit, "CNPJ")
+    emit_cpf = _xml_text(emit, "CPF")
+    dest_cnpj = _xml_text(dest, "CNPJ")
+    dest_cpf = _xml_text(dest, "CPF")
+    value_total = _format_brazilian_money(_xml_text(icms_total, "vNF"))
+    access_key = str(inf_nfe.attrib.get("Id", ""))
+    if access_key.startswith("NFe"):
+        access_key = access_key[3:]
+
+    data = {
+        "emitente_nome": _xml_text(emit, "xNome"),
+        "emitente_cpf_cnpj": emit_cnpj or emit_cpf,
+        "numero_nf": _xml_text(ide, "nNF"),
+        "valor_total_nota": value_total,
+        "data_emissao": _xml_text(ide, "dhEmi") or _xml_text(ide, "dEmi"),
+        "chave_acesso": access_key,
+        "destinatario_nome": _xml_text(dest, "xNome"),
+        "destinatario_cpf_cnpj": dest_cnpj or dest_cpf,
+        "origem_dados": "XML fiscal original",
+    }
+    if not any(
+        str(value).strip()
+        for key, value in data.items()
+        if key != "origem_dados"
+    ):
+        return None, "O XML foi lido, mas não contém os campos esperados para extração."
+    return data, ""
+
+
 def extract_fields_from_text(text, doc_type):
     """Conservative local extraction. Missing values remain blank; no invented data."""
     if not text:
@@ -100,11 +183,11 @@ def extract_fields_from_text(text, doc_type):
             "emitente_nome": first([
                 r"(?:Raz[aã]o Social|Nome/Raz[aã]o Social|Emitente)\s*[:\-]?\s*([^\n]+)",
             ]),
-                      "emitente_cpf_cnpj": first([
+            "emitente_cpf_cnpj": first([
                 r"(?:CPF/CNPJ|CNPJ)\s*[:\-]?\s*(\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2})",
                 r"(\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2})",
                 r"(?:CPF)\s*[:\-]?\s*(\d{3}\.?\d{3}\.?\d{3}-?\d{2})",
-                r"(\d{3}\.?\d{3}\.?\d{3}-\d{2})",
+                r"(\d{3}\.\d{3}\.\d{3}-\d{2})",
             ]),
             "numero_nf": first([
                 r"(?:N[ºo°]\s*(?:da\s*)?NF-e|N[úu]mero da Nota|N[ºo°]\s*Nota|NF-e)\s*[:#\-]?\s*([0-9]{1,})",
@@ -113,7 +196,6 @@ def extract_fields_from_text(text, doc_type):
                 r"(?:Valor Total da Nota|Valor Total|Total da Nota)\s*[:R$\s]*([0-9.]+,[0-9]{2}|[0-9]+\.[0-9]{2})",
             ]),
         }
-    
     elif doc_type == "gta":
         data = {
             "numero_gta": first([
@@ -134,7 +216,6 @@ def extract_fields_from_text(text, doc_type):
                 r"(?:Munic[ií]pio de destino|Destino)\s*[:\-]?\s*([^\n]+)",
             ]),
         }
-
     else:
         data = {
             "numero_car": first([
@@ -173,7 +254,7 @@ def extract_with_gemini(file_bytes, filename, doc_type, client):
             'as chaves "emitente_nome", "emitente_cpf_cnpj", "numero_nf", "valor_total_nota". '
             'Se um campo não estiver legível ou não existir, use string vazia. Não invente dados.'
         ),
-               "gta": (
+        "gta": (
             'Extraia os dados desta Guia de Trânsito Animal (GTA). Retorne apenas JSON válido com '
             'as chaves "numero_gta", "emitente", "emitente_cpf_cnpj", '
             '"quantidade_cabecas", "destino_uf_municipio". '
@@ -209,27 +290,14 @@ def extract_with_gemini(file_bytes, filename, doc_type, client):
         return None, f"Falha na análise por IA: {exc}"
 
 
-
 def format_doc_summary(item):
-    raw = item.get("RawData") or {}
+    raw = item.get("RawData", {})
     doc_type = item.get("Tipo Documento", "")
-
     if "Nota" in doc_type:
-        return (
-            raw.get("numero_nf", ""),
-            f"R$ {raw.get('valor_total_nota', '')}".strip(),
-        )
-
+        return raw.get("numero_nf", ""), f"R$ {raw.get('valor_total_nota', '')}".strip()
     if "Guia" in doc_type:
-        return (
-            raw.get("numero_gta", ""),
-            f"{raw.get('quantidade_cabecas', '')} cabeças".strip(),
-        )
-
-    return (
-        raw.get("numero_car", ""),
-        f"{raw.get('area_hectares', '')} ha".strip(),
-    )
+        return raw.get("numero_gta", ""), f"{raw.get('quantidade_cabecas', '')} cabeças".strip()
+    return raw.get("numero_car", ""), f"{raw.get('area_hectares', '')} ha".strip()
 
 
 def make_excel(records):
@@ -238,14 +306,8 @@ def make_excel(records):
     ws.title = "AgroSmart"
 
     headers = [
-        "Arquivo",
-        "Data/Hora",
-        "Produtor / Fazenda",
-        "CPF/CNPJ",
-        "Tipo Documento",
-        "Identificador",
-        "Detalhes",
-        "Status",
+        "Arquivo", "Data/Hora", "Produtor / Fazenda", "CPF/CNPJ",
+        "Tipo Documento", "Identificador", "Detalhes", "Status",
         "Dados extraídos (JSON)",
     ]
     ws.append(headers)
@@ -253,26 +315,15 @@ def make_excel(records):
     header_fill = PatternFill("solid", fgColor="1B4332")
     header_font = Font(bold=True, color="FFFFFF")
     thin = Side(style="thin", color="D3D3D3")
-
     for cell in ws[1]:
         cell.fill = header_fill
         cell.font = header_font
-        cell.alignment = Alignment(
-            horizontal="center",
-            vertical="center",
-            wrap_text=True,
-        )
-        cell.border = Border(
-            left=thin,
-            right=thin,
-            top=thin,
-            bottom=thin,
-        )
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
     for item in records:
         ident, detail = format_doc_summary(item)
         raw = item.get("RawData") or {}
-
         ws.append([
             item.get("NomeFicheiro", ""),
             item.get("Data/Hora", ""),
@@ -287,71 +338,42 @@ def make_excel(records):
 
     for row in ws.iter_rows(min_row=2):
         for cell in row:
-            cell.border = Border(
-                left=thin,
-                right=thin,
-                top=thin,
-                bottom=thin,
-            )
-            cell.alignment = Alignment(
-                vertical="top",
-                wrap_text=True,
-            )
+            cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
 
     widths = [28, 20, 32, 22, 34, 22, 26, 42, 70]
-
     for index, width in enumerate(widths, start=1):
-        ws.column_dimensions[
-            ws.cell(row=1, column=index).column_letter
-        ].width = width
-
+        ws.column_dimensions[ws.cell(row=1, column=index).column_letter].width = width
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
 
     output = io.BytesIO()
     wb.save(output)
     output.seek(0)
-
     return output.getvalue()
-
 
 def make_domain_txt(records):
     lines = []
-
     for item in records:
         raw = item.get("RawData") or {}
         doc_type = item.get("Tipo Documento", "")
         producer = str(item.get("ProdutorIdentificado", ""))
-
         if "Nota" in doc_type:
-            value = str(
-                raw.get("valor_total_nota", "")
-            ).replace(".", "").replace(",", "")
-
+            value = str(raw.get("valor_total_nota", "")).replace(".", "").replace(",", "")
             cnpj = str(raw.get("emitente_cpf_cnpj", ""))
-
             lines.append(
-                f"DOMINIO_NF|{producer}|NF|"
-                f"{raw.get('numero_nf', '')}|{value}|CNPJ|{cnpj}"
+                f"DOMINIO_NF|{producer}|NF|{raw.get('numero_nf', '')}|{value}|CNPJ|{cnpj}"
             )
-
         elif "Guia" in doc_type:
-            cpf_cnpj = str(raw.get("emitente_cpf_cnpj", ""))
-
+            cnpj = str(raw.get("emitente_cpf_cnpj", ""))
             lines.append(
-                f"DOMINIO_GTA|{producer}|GTA|"
-                f"{raw.get('numero_gta', '')}|"
-                f"{raw.get('quantidade_cabecas', '')}|"
-                f"CPF_CNPJ|{cpf_cnpj}"
+                f"DOMINIO_GTA|{producer}|GTA|{raw.get('numero_gta', '')}|"
+                f"{raw.get('quantidade_cabecas', '')}|CPF_CNPJ|{cnpj}"
             )
-
         else:
-            lines.append(
-                f"DOMINIO_CAR|{producer}|CAR|"
-                f"{raw.get('numero_car', '')}"
-            )
-
+            lines.append(f"DOMINIO_CAR|{producer}|CAR|{raw.get('numero_car', '')}")
     return "\n".join(lines)
+
 
 # ---------------------------
 # Supabase authentication + persistence
@@ -461,79 +483,43 @@ def delete_document(settings, doc_id):
     db.table("documents").delete().eq("id", doc_id).execute()
 
 
-
 def show_login(settings, supabase):
     st.title("🌾 AgroSmart")
     st.subheader("Acesse sua conta")
     login_tab, recover_tab = st.tabs(["Entrar", "Esqueci minha senha"])
-
     with login_tab:
         with st.form("login_form"):
             email = st.text_input("E-mail", key="login_email").strip().lower()
-            password = st.text_input("Senha", type="password")
-            submitted = st.form_submit_button(
-                "Entrar", type="primary", use_container_width=True
-            )
-
+            password = st.text_input("Senha", type="password", key="login_password")
+            submitted = st.form_submit_button("Entrar", type="primary", use_container_width=True)
         if submitted:
             try:
-                response = supabase.auth.sign_in_with_password(
-                    {"email": email, "password": password}
-                )
+                response = supabase.auth.sign_in_with_password({"email": email, "password": password})
                 if response_user(response):
                     st.rerun()
                 else:
-                    st.error(
-                        "Não foi possível iniciar a sessão. Confirme seu e-mail "
-                        "e senha e verifique a confirmação do e-mail, se ativada."
-                    )
+                    st.error("Não foi possível iniciar a sessão. Confirme seu e-mail e senha e verifique a confirmação do e-mail, se ativada.")
             except Exception:
-                st.error(
-                    "Não foi possível entrar. Verifique o e-mail e a senha "
-                    "ou tente novamente."
-                )
-
+                st.error("Não foi possível entrar. Verifique o e-mail e a senha ou tente novamente.")
     with recover_tab:
-        st.write(
-            "Informe o e-mail cadastrado. Se a conta existir, "
-            "você receberá um link para criar outra senha."
-        )
-
+        st.write("Informe o e-mail cadastrado. Se a conta existir, você receberá um link para criar outra senha.")
         with st.form("recover_form"):
-            recover_email = st.text_input(
-                "E-mail da conta", key="recover_email"
-            ).strip().lower()
-            recover_submit = st.form_submit_button(
-                "Enviar link de recuperação",
-                use_container_width=True,
-            )
-
+            recover_email = st.text_input("E-mail da conta", key="recover_email").strip().lower()
+            recover_submit = st.form_submit_button("Enviar link de recuperação", use_container_width=True)
         if recover_submit:
             if not settings.get("app_url"):
-                st.error(
-                    "O administrador precisa configurar APP_URL "
-                    "nos Secrets do Streamlit Cloud."
-                )
+                st.error("O administrador precisa configurar APP_URL nos Secrets do Streamlit Cloud.")
             elif not recover_email:
                 st.warning("Informe o e-mail da conta.")
             else:
                 try:
                     supabase.auth.reset_password_for_email(
                         recover_email,
-                        {
-                            "redirect_to": (
-                                f"{settings['app_url']}/?mode=recovery"
-                            )
-                        },
+                        {"redirect_to": f"{settings['app_url']}/?mode=recovery"},
                     )
-                    st.success(
-                        "Se o e-mail estiver cadastrado, o link de "
-                        "recuperação será enviado."
-                    )
+                    st.success("Se o e-mail estiver cadastrado, o link de recuperação será enviado.")
                 except Exception as exc:
-                    st.error(
-                        f"Erro ao solicitar recuperação: {exc}"
-                    )
+                    st.error(f"Erro ao solicitar recuperação: {exc}")
 
 
 def admin_panel(settings):
@@ -767,7 +753,22 @@ except Exception as exc:
 st.divider()
 doc_type = TIPOS_DOCUMENTO[doc_label]
 st.subheader(f"📁 Carregar documentos: {doc_label}")
-uploaded_files = st.file_uploader("Selecione um ou mais documentos (PDF, PNG ou JPG)", type=["pdf", "png", "jpg", "jpeg"], accept_multiple_files=True)
+uploaded_files = st.file_uploader(
+    "Selecione documentos PDF, XML fiscal, PNG ou JPG",
+    type=["pdf", "xml", "png", "jpg", "jpeg"],
+    accept_multiple_files=True,
+)
+
+if uploaded_files:
+    for xml_upload in uploaded_files:
+        if xml_upload.name.lower().endswith(".xml"):
+            st.download_button(
+                f"Baixar XML original: {xml_upload.name}",
+                data=xml_upload.getvalue(),
+                file_name=xml_upload.name,
+                mime="application/xml",
+                key=f"download_original_xml_{xml_upload.name}",
+            )
 
 if uploaded_files and st.button("🚀 Processar documentos", type="primary"):
     client = get_gemini_client(api_key)
@@ -779,13 +780,20 @@ if uploaded_files and st.button("🚀 Processar documentos", type="primary"):
         file_bytes = uploaded.getvalue()
         data = None
         method = ""
-        if uploaded.name.lower().endswith(".pdf"):
+        is_xml = uploaded.name.lower().endswith(".xml")
+        if is_xml:
+            data, error = extract_fields_from_xml(file_bytes, doc_type)
+            if data:
+                method = "Extraído do XML fiscal original — confira os campos."
+            else:
+                method = error or "Não foi possível extrair os dados do XML."
+        elif uploaded.name.lower().endswith(".pdf"):
             pdf_text = extract_pdf_text(file_bytes)
             if pdf_text:
                 data = extract_fields_from_text(pdf_text, doc_type)
                 if data:
                     method = "Extraído do texto do PDF — confira os campos."
-        if not data and client:
+        if not data and client and not is_xml:
             data, error = extract_with_gemini(file_bytes, uploaded.name, doc_type, client)
             if data:
                 method = "Extraído com Gemini — confira os campos."
@@ -853,9 +861,8 @@ else:
             "Status": item.get("StatusAuditoria", ""),
         })
     st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
-    
-    st.subheader("🗑️ Remover documento")
 
+    st.subheader("🗑️ Remover documento")
     selected_doc = st.selectbox(
         "Selecione o documento que deseja excluir:",
         options=visible,
@@ -866,13 +873,10 @@ else:
         ),
         key="doc_to_delete",
     )
-
     confirm_delete = st.checkbox(
-        f"Confirmo a exclusão do documento "
-        f"{selected_doc.get('NomeFicheiro', '')}",
+        f"Confirmo a exclusão do documento {selected_doc.get('NomeFicheiro', '')}",
         key=f"confirm_delete_{selected_doc['id']}",
     )
-
     if st.button(
         "🗑️ Excluir documento selecionado",
         disabled=not confirm_delete,
