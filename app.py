@@ -995,77 +995,69 @@ else:
     col1.metric("Documentos exibidos", len(visible))
     col2.metric("Extrações concluídas", sum("Extração concluída" in r.get("StatusAuditoria", "") for r in visible))
     col3.metric("Precisam de revisão", sum("Revisão necessária" in r.get("StatusAuditoria", "") for r in visible))
-    table_rows = []
+    # Lista de documentos com ação de exclusão ao lado de cada registro.
+    # A exclusão só ocorre após uma confirmação explícita daquele documento.
+    st.markdown("**Documentos da sua conta**")
+    header_cols = st.columns([2.6, 1.25, 1.55, 2.0, 1.65, 1.05])
+    header_cols[0].markdown("**Arquivo**")
+    header_cols[1].markdown("**Tipo**")
+    header_cols[2].markdown("**Data / hora**")
+    header_cols[3].markdown("**Produtor / Fazenda**")
+    header_cols[4].markdown("**Status**")
+    header_cols[5].markdown("**Ação**")
+
+    pending_delete_id = str(
+        st.session_state.get("agrosmart_pending_delete_id", "")
+    )
+
     for item in visible:
-        ident, detail = format_doc_summary(item)
-        table_rows.append({
-            "Arquivo": item.get("NomeFicheiro", ""),
-            "Produtor / Fazenda": item.get("ProdutorIdentificado", "") or "Não identificado",
-            "CPF/CNPJ": (item.get("RawData") or {}).get("emitente_cpf_cnpj", "") or "Não identificado",
-            "Tipo": item.get("Tipo Documento", ""),
-            "Identificador": ident or "Não identificado",
-            "Detalhes": detail or "Não identificado",
-            "Status": item.get("StatusAuditoria", ""),
-        })
-    st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
-
-    with st.expander("🗑️ Remover documentos", expanded=False):
-        st.caption(
-            "Selecione um ou vários registros para excluir. A exclusão remove "
-            "permanentemente os registros e dados extraídos do banco."
+        record_id = str(item.get("id") or "")
+        row_cols = st.columns([2.6, 1.25, 1.55, 2.0, 1.65, 1.05])
+        row_cols[0].write(item.get("NomeFicheiro", "Sem nome"))
+        row_cols[1].write(item.get("Tipo Documento", ""))
+        row_cols[2].write(item.get("Data/Hora", ""))
+        row_cols[3].write(
+            item.get("ProdutorIdentificado", "") or "Não identificado"
         )
-        delete_options = {}
-        for record in visible:
-            record_id = str(record.get("id", ""))
-            label = (
-                f"{record.get('NomeFicheiro', 'Sem nome')} — "
-                f"{record.get('Data/Hora', '')} — "
-                f"{record.get('Tipo Documento', '')} — ID {record_id[:8]}"
-            )
-            delete_options[label] = record.get("id")
+        row_cols[4].write(item.get("StatusAuditoria", ""))
 
-        selected_delete_labels = st.multiselect(
-            "Selecione os documentos a remover",
-            options=list(delete_options.keys()),
-            key="selected_documents_to_delete",
-            placeholder="Escolha um ou mais documentos...",
-        )
-        selected_delete_ids = [
-            delete_options[label] for label in selected_delete_labels
-        ]
-        selected_ids_key = hashlib.sha256(
-            "|".join(sorted(str(value) for value in selected_delete_ids)).encode("utf-8")
-        ).hexdigest()[:12]
-        confirm_delete = st.checkbox(
-            f"Confirmo a exclusão permanente de {len(selected_delete_ids)} registro(s).",
-            key=f"confirm_delete_{selected_ids_key}",
-            disabled=not selected_delete_ids,
-        )
-
-        if st.button(
-            "🗑️ Excluir documentos selecionados",
-            disabled=not selected_delete_ids or not confirm_delete,
-            key="delete_selected_documents_button",
+        if row_cols[5].button(
+            "🗑️ Excluir",
+            key=f"request_delete_{record_id}",
+            help="Solicitar exclusão deste documento",
+            use_container_width=True,
         ):
-            deleted = 0
-            delete_errors = []
-            for doc_id in selected_delete_ids:
-                try:
-                    delete_document(settings, doc_id)
-                    deleted += 1
-                except Exception as exc:
-                    delete_errors.append(str(exc))
-
-            if deleted:
-                st.session_state["_agrosmart_delete_flash"] = (
-                    f"{deleted} documento(s) removido(s) com sucesso."
-                )
-            if delete_errors:
-                st.session_state["_agrosmart_delete_error_flash"] = (
-                    "Alguns registros não puderam ser removidos: "
-                    + "; ".join(delete_errors)
-                )
+            st.session_state["agrosmart_pending_delete_id"] = record_id
             st.rerun()
+
+        if record_id and record_id == pending_delete_id:
+            st.warning(
+                f"Confirma a exclusão de **{item.get('NomeFicheiro', 'este documento')}**? "
+                "Os dados extraídos deste registro serão removidos permanentemente."
+            )
+            confirm_cols = st.columns([1.5, 1.0, 5.0])
+            if confirm_cols[0].button(
+                "Sim, excluir documento",
+                type="primary",
+                key=f"confirm_delete_{record_id}",
+            ):
+                try:
+                    delete_document(settings, item.get("id"))
+                    st.session_state.pop("agrosmart_pending_delete_id", None)
+                    st.session_state["_agrosmart_delete_flash"] = (
+                        f"Documento '{item.get('NomeFicheiro', '')}' removido com sucesso."
+                    )
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Não foi possível remover o documento: {exc}")
+            if confirm_cols[1].button(
+                "Cancelar",
+                key=f"cancel_delete_{record_id}",
+            ):
+                st.session_state.pop("agrosmart_pending_delete_id", None)
+                st.rerun()
+
+        st.divider()
 
     with st.expander("Ver dados extraídos e observações"):
         for item in visible:
