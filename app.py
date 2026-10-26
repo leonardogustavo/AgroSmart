@@ -255,10 +255,7 @@ def make_excel(records):
             wrap_text=True,
         )
         cell.border = Border(
-            left=thin,
-            right=thin,
-            top=thin,
-            bottom=thin,
+            left=thin, right=thin, top=thin, bottom=thin
         )
 
     for item in records:
@@ -280,18 +277,13 @@ def make_excel(records):
     for row in ws.iter_rows(min_row=2):
         for cell in row:
             cell.border = Border(
-                left=thin,
-                right=thin,
-                top=thin,
-                bottom=thin,
+                left=thin, right=thin, top=thin, bottom=thin
             )
             cell.alignment = Alignment(
-                vertical="top",
-                wrap_text=True,
+                vertical="top", wrap_text=True
             )
 
     widths = [28, 20, 32, 22, 34, 22, 26, 42, 70]
-
     for index, width in enumerate(widths, start=1):
         ws.column_dimensions[
             ws.cell(row=1, column=index).column_letter
@@ -303,7 +295,6 @@ def make_excel(records):
     output = io.BytesIO()
     wb.save(output)
     output.seek(0)
-
     return output.getvalue()
 
 
