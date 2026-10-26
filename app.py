@@ -415,9 +415,8 @@ def show_login(settings, supabase):
                         {"redirect_to": f"{settings['app_url']}/?mode=recovery"},
                     )
                     st.success("Se o e-mail estiver cadastrado, o link de recuperação será enviado.")
-                except Exception:
-                    st.success("Se o e-mail estiver cadastrado, o link de recuperação será enviado. Aguarde alguns minutos e confira o spam.")
-
+                               except Exception as exc:
+                    st.error(f"Erro ao solicitar recuperação: {exc}")
 
 def admin_panel(settings):
     st.subheader("🛡️ Administração de clientes")
