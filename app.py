@@ -771,6 +771,38 @@ else:
             "Status": item.get("StatusAuditoria", ""),
         })
     st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
+    
+    st.subheader("🗑️ Remover documento")
+
+    selected_doc = st.selectbox(
+        "Selecione o documento que deseja excluir:",
+        options=visible,
+        format_func=lambda item: (
+            f"{item.get('NomeFicheiro', 'Sem nome')} — "
+            f"{item.get('Data/Hora', '')} — "
+            f"{item.get('Tipo Documento', '')}"
+        ),
+        key="doc_to_delete",
+    )
+
+    confirm_delete = st.checkbox(
+        f"Confirmo a exclusão do documento "
+        f"{selected_doc.get('NomeFicheiro', '')}",
+        key=f"confirm_delete_{selected_doc['id']}",
+    )
+
+    if st.button(
+        "🗑️ Excluir documento selecionado",
+        disabled=not confirm_delete,
+        key=f"delete_{selected_doc['id']}",
+    ):
+        try:
+            delete_document(settings, selected_doc["id"])
+            st.success("Documento excluído com sucesso!")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Não foi possível excluir o documento: {exc}")
+
     with st.expander("Ver dados extraídos e observações"):
         for item in visible:
             st.markdown(f"**{item.get('NomeFicheiro', '')}**")
