@@ -100,9 +100,11 @@ def extract_fields_from_text(text, doc_type):
             "emitente_nome": first([
                 r"(?:Raz[aã]o Social|Nome/Raz[aã]o Social|Emitente)\s*[:\-]?\s*([^\n]+)",
             ]),
-            "emitente_cpf_cnpj": first([
-                r"(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})",
-                r"(\d{3}\.\d{3}\.\d{3}-\d{2})",
+                      "emitente_cpf_cnpj": first([
+                r"(?:CPF/CNPJ|CNPJ)\s*[:\-]?\s*(\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2})",
+                r"(\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2})",
+                r"(?:CPF)\s*[:\-]?\s*(\d{3}\.?\d{3}\.?\d{3}-?\d{2})",
+                r"(\d{3}\.?\d{3}\.?\d{3}-\d{2})",
             ]),
             "numero_nf": first([
                 r"(?:N[ºo°]\s*(?:da\s*)?NF-e|N[úu]mero da Nota|N[ºo°]\s*Nota|NF-e)\s*[:#\-]?\s*([0-9]{1,})",
@@ -213,9 +215,10 @@ def make_excel(records):
     wb = Workbook()
     ws = wb.active
     ws.title = "AgroSmart"
-    headers = [
-        "Arquivo", "Data/Hora", "Produtor / Fazenda", "Tipo Documento",
-        "Identificador", "Detalhes", "Status", "Dados extraídos (JSON)"
+        headers = [
+        "Arquivo", "Data/Hora", "Produtor / Fazenda", "CPF/CNPJ",
+        "Tipo Documento", "Identificador", "Detalhes", "Status",
+        "Dados extraídos (JSON)"
     ]
     ws.append(headers)
     header_fill = PatternFill("solid", fgColor="1B4332")
@@ -229,10 +232,11 @@ def make_excel(records):
 
     for item in records:
         ident, detail = format_doc_summary(item)
-        ws.append([
+               ws.append([
             item.get("NomeFicheiro", ""),
             item.get("Data/Hora", ""),
             item.get("ProdutorIdentificado", ""),
+            (item.get("RawData") or {}).get("emitente_cpf_cnpj", ""),
             item.get("Tipo Documento", ""),
             ident or "",
             detail or "",
@@ -243,7 +247,7 @@ def make_excel(records):
         for cell in row:
             cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
             cell.alignment = Alignment(vertical="top", wrap_text=True)
-    widths = [28, 20, 32, 34, 22, 26, 42, 70]
+        widths = [28, 20, 32, 22, 34, 22, 26, 42, 70]
     for index, width in enumerate(widths, start=1):
         ws.column_dimensions[chr(64 + index)].width = width
     ws.freeze_panes = "A2"
@@ -256,19 +260,34 @@ def make_excel(records):
 
 def make_domain_txt(records):
     lines = []
+
     for item in records:
-        raw = item.get("RawData", {})
+        raw = item.get("RawData") or {}
         doc_type = item.get("Tipo Documento", "")
         producer = str(item.get("ProdutorIdentificado", ""))
+
         if "Nota" in doc_type:
             value = str(raw.get("valor_total_nota", "")).replace(".", "").replace(",", "")
-            lines.append(f"DOMINIO_NF|{producer}|NF|{raw.get('numero_nf', '')}|{value}")
+            cnpj = str(raw.get("emitente_cpf_cnpj", ""))
+
+            lines.append(
+                f"DOMINIO_NF|{producer}|NF|"
+                f"{raw.get('numero_nf', '')}|{value}|CNPJ|{cnpj}"
+            )
+
         elif "Guia" in doc_type:
             lines.append(
-                f"DOMINIO_GTA|{producer}|GTA|{raw.get('numero_gta', '')}|{raw.get('quantidade_cabecas', '')}"
+                f"DOMINIO_GTA|{producer}|GTA|"
+                f"{raw.get('numero_gta', '')}|"
+                f"{raw.get('quantidade_cabecas', '')}"
             )
+
         else:
-            lines.append(f"DOMINIO_CAR|{producer}|CAR|{raw.get('numero_car', '')}")
+            lines.append(
+                f"DOMINIO_CAR|{producer}|CAR|"
+                f"{raw.get('numero_car', '')}"
+            )
+
     return "\n".join(lines)
 
 
