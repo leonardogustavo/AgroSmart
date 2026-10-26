@@ -403,7 +403,7 @@ def show_login(settings, supabase):
         with st.form("recover_form"):
             recover_email = st.text_input("E-mail da conta", key="recover_email").strip().lower()
             recover_submit = st.form_submit_button("Enviar link de recuperação", use_container_width=True)
-        if recover_submit:
+                if recover_submit:
             if not settings.get("app_url"):
                 st.error("O administrador precisa configurar APP_URL nos Secrets do Streamlit Cloud.")
             elif not recover_email:
@@ -414,8 +414,10 @@ def show_login(settings, supabase):
                         recover_email,
                         {"redirect_to": f"{settings['app_url']}/?mode=recovery"},
                     )
-                    st.success("Se o e-mail estiver cadastrado, o link de recuperação será enviado.")
-                               except Exception as exc:
+                    st.success(
+                        "Se o e-mail estiver cadastrado, o link de recuperação será enviado."
+                    )
+                except Exception as exc:
                     st.error(f"Erro ao solicitar recuperação: {exc}")
 
 def admin_panel(settings):
