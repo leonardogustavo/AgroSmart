@@ -1,535 +1,749 @@
-import streamlit as st
+import io
+import json
+import re
+import time
+from datetime import datetime
+
 import pandas as pd
-import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 import pdfplumber
-import json
-import time
-import io
-import re
+import streamlit as st
 from PIL import Image
+from supabase import create_client
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
-# Importação segura do Gemini
+# Gemini is optional: the app still runs without it.
 try:
     from google import genai
+    from google.genai import types
 except ImportError:
-    try:
-        import google.generativeai as genai
-    except ImportError:
-        genai = None
-    import pandas as pd
-except ImportError:
-    pass
+    genai = None
+    types = None
 
-# Importação segura do Gemini
-try:
-    from google import genai
-except ImportError:
-    try:
-        import google.generativeai as genai
-    except ImportError:
-        genai = None
 
-import json
-import time
-import io
-import re
-from PIL import Image
-# Importação segura do Gemini (tenta a biblioteca nova ou a clássica sem rebentar a app)
-try:
-    from google import genai
-except ImportError:
-    try:
-        import google.generativeai as genai
-    except ImportError:
-        genai = None
-        st.error("⚠️ Atenção: Nenhuma biblioteca do Google GenAI foi encontrada no ambiente.")
-# Configuração da página
 st.set_page_config(
     page_title="AgroSmart - Gestão de NFP-e, GTA & CAR",
     page_icon="🌾",
-    layout="wide"
+    layout="wide",
 )
 
-# --- ESTILIZAÇÃO CSS CUSTOMIZADA (TEMA AGRO) ---
-st.markdown("""
+st.markdown(
+    """
     <style>
-    .stApp {
-        background: linear-gradient(135deg, #f4f6f0 0%, #e8efe2 100%);
-    }
-    h1 {
-        color: #1b4332 !important;
-        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-        font-weight: 700;
-    }
-    h2, h3 {
-        color: #2d6a4f !important;
-    }
-    [data-testid="stSidebar"] {
-        background-color: #d8f3dc !important;
-        border-right: 2px solid #b7e4c7;
-    }
-    [data-testid="stSidebar"] * {
-        color: #1b4332 !important;
-        font-weight: 600;
-    }
-    div.stButton > button[kind="primary"] {
-        background-color: #2d6a4f !important;
-        color: white !important;
-        border-radius: 8px !important;
-        border: none !important;
-        font-weight: bold !important;
-        box-shadow: 0px 4px 10px rgba(0, 0, 0, 0.15) !important;
-        transition: all 0.3s ease !important;
-    }
-    div.stButton > button[kind="primary"]:hover {
-        background-color: #40916c !important;
-        transform: translateY(-2px);
-    }
-    div.stButton > button[kind="secondary"] {
-        background-color: #1b4332 !important;
-        color: #ffffff !important;
-        border-radius: 8px !important;
-        font-weight: bold !important;
-    }
-    div.stButton > button[kind="secondary"]:hover {
-        background-color: #2d6a4f !important;
-    }
+    .stApp { background: linear-gradient(135deg, #f4f6f0 0%, #e8efe2 100%); }
+    h1 { color: #1b4332 !important; font-weight: 700; }
+    h2, h3 { color: #2d6a4f !important; }
+    [data-testid="stSidebar"] { background-color: #d8f3dc; }
     [data-testid="stFileUploader"] {
-        background-color: #ffffff;
-        padding: 15px;
-        border-radius: 10px;
+        background: #fff; padding: 12px; border-radius: 10px;
         border: 1px solid #b7e4c7;
-        box-shadow: 0px 2px 8px rgba(0, 0, 0, 0.05);
     }
     </style>
-""", unsafe_allow_html=True)
+    """,
+    unsafe_allow_html=True,
+)
 
-if 'lancamentos' not in st.session_state:
+if "lancamentos" not in st.session_state:
     st.session_state.lancamentos = []
 
+
+TIPOS_DOCUMENTO = {
+    "Nota Fiscal de Produtor (NFP-e)": "nota",
+    "Guia de Trânsito Animal (GTA)": "gta",
+    "Cadastro Ambiental Rural (CAR)": "car",
+}
+
+
 def parse_json_safely(text):
+    """Extract a JSON object from a model response."""
     if not text:
         return None
     cleaned = text.strip()
-    if cleaned.startswith("```json"):
-        cleaned = cleaned[7:]
-    elif cleaned.startswith("```"):
-        cleaned = cleaned[3:]
-    if cleaned.endswith("```"):
-        cleaned = cleaned[:-3]
-    cleaned = cleaned.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
     try:
-        return json.loads(cleaned)
-    except Exception:
-        return None
+        result = json.loads(cleaned)
+        return result if isinstance(result, dict) else None
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+        if match:
+            try:
+                result = json.loads(match.group(0))
+                return result if isinstance(result, dict) else None
+            except json.JSONDecodeError:
+                return None
+    return None
 
-def extrair_dados_pdf_nativo(file_bytes, tipo_doc):
+
+def extract_pdf_text(file_bytes):
     try:
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-            if not pdf.pages:
-                return None
-            texto_completo = pdf.pages[0].extract_text()
-            if not texto_completo:
-                return None
-            
-            if "Nota" in tipo_doc:
-                match_nf = re.search(r'(?:N[ºo°]\.?|NF-e|Nota)[:\s]*([0-9]+)', texto_completo, re.IGNORECASE)
-                match_cnpj = re.search(r'\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}', texto_completo)
-                match_valor = re.search(r'(?:Total|Valor Total|R\$)\s*[:\s]*([0-9\.,]+)', texto_completo, re.IGNORECASE)
-                return {
-                    "emitente_nome": "Fazenda Boa Esperança",
-                    "emitente_cpf_cnpj": match_cnpj.group(0) if match_cnpj else "00.000.000/0001-91",
-                    "numero_nf": match_nf.group(1) if match_nf else "1001",
-                    "valor_total_nota": match_valor.group(1) if match_valor else "45000.00"
-                }
-            elif "Guia" in tipo_doc:
-                match_gta = re.search(r'(?:GTA|Guia)[:\s]*([0-9]+)', texto_completo, re.IGNORECASE)
-                match_qtd = re.search(r'(?:Quantidade|Cabecas|Qtd|Animais)[:\s]*([0-9]+)', texto_completo, re.IGNORECASE)
-                return {
-                    "numero_gta": match_gta.group(1) if match_gta else "8881",
-                    "emitente": "Fazenda Boa Esperança",
-                    "quantidade_cabecas": match_qtd.group(1) if match_qtd else "40",
-                    "destino_uf_municipio": "Frigorífico Regional"
-                }
-            else: # CAR
-                match_car = re.search(r'([A-Z]{2}-[0-9]+-[0-9A-F]+)', texto_completo)
-                match_area = re.search(r'([0-9\.,]+)\s*(?:ha|hectares)', texto_completo, re.IGNORECASE)
-                return {
-                    "numero_car": match_car.group(1) if match_car else "RO-1100015-4C8E",
-                    "proprietario": "Fazenda Boa Esperança",
-                    "area_hectares": match_area.group(1) if match_area else "250.0",
-                    "status_car": "Ativo / Regular"
-                }
+            return "\n".join((page.extract_text() or "") for page in pdf.pages).strip()
+    except Exception:
+        return ""
+
+
+def extract_fields_from_text(text, doc_type):
+    """Conservative local extraction. Missing values remain blank; no invented data."""
+    if not text:
+        return None
+
+    def first(patterns):
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+        return ""
+
+    if doc_type == "nota":
+        data = {
+            "emitente_nome": first([
+                r"(?:Raz[aã]o Social|Nome/Raz[aã]o Social|Emitente)\s*[:\-]?\s*([^\n]+)",
+            ]),
+            "emitente_cpf_cnpj": first([
+                r"(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})",
+                r"(\d{3}\.\d{3}\.\d{3}-\d{2})",
+            ]),
+            "numero_nf": first([
+                r"(?:N[ºo°]\s*(?:da\s*)?NF-e|N[úu]mero da Nota|N[ºo°]\s*Nota|NF-e)\s*[:#\-]?\s*([0-9]{1,})",
+            ]),
+            "valor_total_nota": first([
+                r"(?:Valor Total da Nota|Valor Total|Total da Nota)\s*[:R$\s]*([0-9.]+,[0-9]{2}|[0-9]+\.[0-9]{2})",
+            ]),
+        }
+    elif doc_type == "gta":
+        data = {
+            "numero_gta": first([
+                r"(?:N[ºo°]\s*(?:da\s*)?GTA|N[úu]mero da GTA|GTA)\s*[:#\-]?\s*([A-Z0-9./\-]+)",
+            ]),
+            "emitente": first([
+                r"(?:Produtor|Propriet[aá]rio|Emitente|Nome do produtor)\s*[:\-]?\s*([^\n]+)",
+            ]),
+            "quantidade_cabecas": first([
+                r"(?:Quantidade de animais|Quantidade|N[ºo°]\s*de animais|Total de animais)\s*[:\-]?\s*([0-9]+)",
+            ]),
+            "destino_uf_municipio": first([
+                r"(?:Munic[ií]pio de destino|Destino)\s*[:\-]?\s*([^\n]+)",
+            ]),
+        }
+    else:
+        data = {
+            "numero_car": first([
+                r"([A-Z]{2}-\d{5,}-[A-F0-9]+)",
+                r"(?:Registro do CAR|N[ºo°]\s*do CAR|CAR)\s*[:#\-]?\s*([A-Z0-9./\-]+)",
+            ]),
+            "proprietario": first([
+                r"(?:Nome do Im[oó]vel|Propriet[aá]rio|Possuidor|Nome do propriet[aá]rio)\s*[:\-]?\s*([^\n]+)",
+            ]),
+            "area_hectares": first([
+                r"(?:[ÁA]rea total|[ÁA]rea do im[oó]vel|[ÁA]rea)\s*[:\-]?\s*([0-9.]+,[0-9]+|[0-9]+\.[0-9]+)\s*(?:ha|hectares)?",
+            ]),
+            "status_car": first([
+                r"(?:Situa[cç][aã]o do CAR|Status do CAR|Situa[cç][aã]o)\s*[:\-]?\s*([^\n]+)",
+            ]),
+        }
+
+    return data if any(str(value).strip() for value in data.values()) else None
+
+
+def get_gemini_client(api_key):
+    if not api_key or genai is None:
+        return None
+    try:
+        return genai.Client(api_key=api_key)
     except Exception:
         return None
 
-def comprimir_imagem(file_bytes):
-    try:
-        img = Image.open(io.BytesIO(file_bytes))
-        if img.mode in ("RGBA", "P"):
-            img = img.convert("RGB")
-        img.thumbnail((1200, 1200))
-        buffer = io.BytesIO()
-        img.save(buffer, format="JPEG", quality=85)
-        return buffer.getvalue(), "image/jpeg"
-    except Exception:
-        return file_bytes, "image/jpeg"
 
-def gerar_excel_por_tipo(dados_lancamentos):
-    wb = openpyxl.Workbook()
-    HEADER_FILL = PatternFill(start_color="1B4332", end_color="1B4332", fill_type="solid")
-    HEADER_FONT = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
-    NORMAL_FONT = Font(name="Calibri", size=11)
-    THIN_BORDER = Border(
-        left=Side(style='thin', color='D3D3D3'), right=Side(style='thin', color='D3D3D3'),
-        top=Side(style='thin', color='D3D3D3'), bottom=Side(style='thin', color='D3D3D3')
+def extract_with_gemini(file_bytes, filename, doc_type, client):
+    if client is None or types is None:
+        return None, "Gemini não está configurado."
+    prompts = {
+        "nota": (
+            'Extraia os dados desta Nota Fiscal de Produtor. Retorne apenas JSON válido com '
+            'as chaves "emitente_nome", "emitente_cpf_cnpj", "numero_nf", "valor_total_nota". '
+            'Se um campo não estiver legível ou não existir, use string vazia. Não invente dados.'
+        ),
+        "gta": (
+            'Extraia os dados desta Guia de Trânsito Animal (GTA). Retorne apenas JSON válido com '
+            'as chaves "numero_gta", "emitente", "quantidade_cabecas", "destino_uf_municipio". '
+            'Se um campo não estiver legível ou não existir, use string vazia. Não invente dados.'
+        ),
+        "car": (
+            'Extraia os dados deste documento do Cadastro Ambiental Rural (CAR). Retorne apenas JSON válido com '
+            'as chaves "numero_car", "proprietario", "area_hectares", "status_car". '
+            'Se um campo não estiver legível ou não existir, use string vazia. Não invente dados.'
+        ),
+    }
+    suffix = filename.lower()
+    mime_type = "application/pdf" if suffix.endswith(".pdf") else (
+        "image/png" if suffix.endswith(".png") else "image/jpeg"
     )
-    
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[
+                types.Part.from_bytes(data=file_bytes, mime_type=mime_type),
+                prompts[doc_type],
+            ],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0,
+            ),
+        )
+        data = parse_json_safely(getattr(response, "text", ""))
+        if data and any(str(value).strip() for value in data.values()):
+            return data, ""
+        return None, "A IA não conseguiu extrair dados legíveis deste documento."
+    except Exception as exc:
+        return None, f"Falha na análise por IA: {exc}"
+
+
+def format_doc_summary(item):
+    raw = item.get("RawData", {})
+    doc_type = item.get("Tipo Documento", "")
+    if "Nota" in doc_type:
+        return raw.get("numero_nf", ""), f"R$ {raw.get('valor_total_nota', '')}".strip()
+    if "Guia" in doc_type:
+        return raw.get("numero_gta", ""), f"{raw.get('quantidade_cabecas', '')} cabeças".strip()
+    return raw.get("numero_car", ""), f"{raw.get('area_hectares', '')} ha".strip()
+
+
+def make_excel(records):
+    wb = Workbook()
     ws = wb.active
-    ws.title = "AgroSmart_Geral"
-    ws.views.sheetView[0].showGridLines = True
-    
+    ws.title = "AgroSmart"
     headers = [
-        "Produtor / Fazenda", "Tipo Doc", "Identificador Principal", 
-        "Detalhes (Valor / Qtd / Área)", "Status do Cruzamento / CAR"
+        "Arquivo", "Data/Hora", "Produtor / Fazenda", "Tipo Documento",
+        "Identificador", "Detalhes", "Status", "Dados extraídos (JSON)"
     ]
     ws.append(headers)
-    
-    for col_idx in range(1, len(headers) + 1):
-        cell = ws.cell(row=1, column=col_idx)
-        cell.fill = HEADER_FILL
-        cell.font = HEADER_FONT
-        cell.alignment = Alignment(horizontal="center", vertical="center")
+    header_fill = PatternFill("solid", fgColor="1B4332")
+    header_font = Font(bold=True, color="FFFFFF")
+    thin = Side(style="thin", color="D3D3D3")
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-    for item in dados_lancamentos:
-        raw = item.get("RawData", {})
-        status = item.get("StatusAuditoria", "✅ Válido")
-        t_doc = item.get("Tipo Documento", "")
-        produtor = item.get("ProdutorIdentificado", "Produtor")
-        
-        if "Nota" in t_doc:
-            ident = raw.get("numero_nf")
-            detalhe = f"R$ {raw.get('valor_total_nota')}"
-        elif "Guia" in t_doc:
-            ident = raw.get("numero_gta")
-            detalhe = f"{raw.get('quantidade_cabecas')} cabeças"
-        else:
-            ident = raw.get("numero_car")
-            detalhe = f"{raw.get('area_hectares')} ha"
-        
+    for item in records:
+        ident, detail = format_doc_summary(item)
         ws.append([
-            produtor,
-            t_doc,
-            str(ident or "N/A"),
-            str(detalhe or "0"),
-            status
+            item.get("NomeFicheiro", ""),
+            item.get("Data/Hora", ""),
+            item.get("ProdutorIdentificado", ""),
+            item.get("Tipo Documento", ""),
+            ident or "",
+            detail or "",
+            item.get("StatusAuditoria", ""),
+            json.dumps(item.get("RawData", {}), ensure_ascii=False),
         ])
-
-    for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+    for row in ws.iter_rows(min_row=2):
         for cell in row:
-            cell.font = NORMAL_FONT
-            cell.border = THIN_BORDER
-
+            cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+    widths = [28, 20, 32, 34, 22, 26, 42, 70]
+    for index, width in enumerate(widths, start=1):
+        ws.column_dimensions[chr(64 + index)].width = width
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
     output = io.BytesIO()
     wb.save(output)
     output.seek(0)
-    return output
+    return output.getvalue()
 
-def gerar_txt_dominio(dados_lancamentos):
-    linhas = []
-    for item in dados_lancamentos:
+
+def make_domain_txt(records):
+    lines = []
+    for item in records:
         raw = item.get("RawData", {})
-        t_doc = item.get("Tipo Documento", "")
-        produtor = item.get("ProdutorIdentificado", "Produtor Rural")
-        
-        if "Nota" in t_doc:
-            nf = raw.get("numero_nf", "0000")
-            valor = str(raw.get("valor_total_nota", "0.00")).replace(".", "").replace(",", "")
-            linhas.append(f"DOMINIO_NF|{produtor}|NF|{nf}|{valor}")
-        elif "Guia" in t_doc:
-            gta = raw.get("numero_gta", "0000")
-            qtd = raw.get("quantidade_cabecas", "0")
-            linhas.append(f"DOMINIO_GTA|{produtor}|GTA|{gta}|{qtd}")
+        doc_type = item.get("Tipo Documento", "")
+        producer = str(item.get("ProdutorIdentificado", ""))
+        if "Nota" in doc_type:
+            value = str(raw.get("valor_total_nota", "")).replace(".", "").replace(",", "")
+            lines.append(f"DOMINIO_NF|{producer}|NF|{raw.get('numero_nf', '')}|{value}")
+        elif "Guia" in doc_type:
+            lines.append(
+                f"DOMINIO_GTA|{producer}|GTA|{raw.get('numero_gta', '')}|{raw.get('quantidade_cabecas', '')}"
+            )
         else:
-            car = raw.get("numero_car", "CAR-PENDENTE")
-            linhas.append(f"DOMINIO_CAR|{produtor}|CAR|{car}")
-            
-    return "\n".join(linhas)
+            lines.append(f"DOMINIO_CAR|{producer}|CAR|{raw.get('numero_car', '')}")
+    return "\n".join(lines)
 
-# --- CABEÇALHO DO SITE ---
-st.title("🌾 AgroSmart - Gestão de NFP-e, GTA & CAR")
-st.markdown("##### *Sistema inteligente de cruzamento fiscal e validação ambiental rural por produtor*")
-st.markdown("---")
 
-# --- BARRA LATERAL ---
-st.sidebar.header("⚙️ Configurações & Filtros")
-
-plano_escolhido = st.sidebar.selectbox(
-    "Selecione o seu Plano:",
-    [
-        "Plano Standard (Grátis / Local - PDF)",
-        "Plano Plus (Com IA Gemini Vision)"
-    ]
-)
-
-usuario_autorizado_ia = False
-api_key_input = ""
-
-if plano_escolhido == "Plano Plus (Com IA Gemini Vision)":
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("🔐 Ativação Plus")
-    licenca_input = st.sidebar.text_input("Chave de Licença Plus / API Key:", type="password")
-    
-    if licenca_input == "AQ.Ab8RN6KkRmsEHg-0SOHjmeSIhRW-yNI8Jjwb57yMHBjGZjKkVw" or len(licenca_input) > 10:
-        st.sidebar.success("✅ Licença Plus Ativa!")
-        usuario_autorizado_ia = True
-        api_key_input = licenca_input
-    else:
-        st.sidebar.warning("⚠️ Insira uma chave válida para desbloquear imagens.")
-else:
-    st.sidebar.info("💡 No **Plano Standard**, apenas PDFs nativos são processados localmente.")
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("🔍 Filtro Rápido de Status")
-filtro_status = st.sidebar.selectbox(
-    "Filtrar Documentos por:",
-    [
-        "Todos os Registos",
-        "✅ Apenas Válidos / Regulares",
-        "⚠️ Apenas Alertas / Duplicados"
-    ]
-)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("⚡ Demonstração Completa (NFP + GTA + CAR)")
-if st.sidebar.button("⚡ Injetar Lote Completo (Fazenda)", type="secondary"):
-    documentos_mock = [
-        {
-            "NomeFicheiro": "nota_fiscal_1045.pdf",
-            "Tipo Documento": "Nota Fiscal de Produtor (NFP-e)",
-            "ProdutorIdentificado": "Agropecuária Boa Esperança Ltda",
-            "RawData": {"numero_nf": "1045", "emitente_nome": "Agropecuária Boa Esperança Ltda", "valor_total_nota": "125000.00"},
-            "StatusAuditoria": "✅ NF Batida com GTA 8891"
-        },
-        {
-            "NomeFicheiro": "gta_8891.pdf",
-            "Tipo Documento": "Guia de Trânsito Animal (GTA)",
-            "ProdutorIdentificado": "Agropecuária Boa Esperança Ltda",
-            "RawData": {"numero_gta": "8891", "emitente": "Agropecuária Boa Esperança Ltda", "quantidade_cabecas": "50"},
-            "StatusAuditoria": "✅ GTA Batida com NF 1045"
-        },
-        {
-            "NomeFicheiro": "recibo_car_oficial.pdf",
-            "Tipo Documento": "Cadastro Ambiental Rural (CAR)",
-            "ProdutorIdentificado": "Agropecuária Boa Esperança Ltda",
-            "RawData": {"numero_car": "RO-1100015-8A2F", "proprietario": "Agropecuária Boa Esperança Ltda", "area_hectares": "320.5", "status_car": "Ativo / Regular"},
-            "StatusAuditoria": "✅ CAR Regularizado e Vinculado"
+# ---------------------------
+# Supabase authentication + persistence
+# ---------------------------
+def get_settings():
+    try:
+        return {
+            "url": st.secrets["SUPABASE_URL"],
+            "anon_key": st.secrets["SUPABASE_ANON_KEY"],
+            "service_key": st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", ""),
+            "app_url": st.secrets.get("APP_URL", "").rstrip("/"),
+            "google_key": st.secrets.get("GOOGLE_API_KEY", ""),
         }
-    ]
-    st.session_state.lancamentos.extend(documentos_mock)
-    st.sidebar.success("Lote completo injetado!")
+    except Exception:
+        return {"url": "", "anon_key": "", "service_key": "", "app_url": "", "google_key": ""}
+
+
+def get_auth_client(settings):
+    # Keep the same client in Streamlit session so the Supabase PKCE verifier
+    # can survive ordinary reruns during the password recovery flow.
+    if "_agrosmart_supabase" not in st.session_state:
+        st.session_state["_agrosmart_supabase"] = create_client(settings["url"], settings["anon_key"])
+    return st.session_state["_agrosmart_supabase"]
+
+
+def get_admin_client(settings):
+    if not settings.get("service_key"):
+        raise RuntimeError("Configure SUPABASE_SERVICE_ROLE_KEY nos Secrets para usar as funções administrativas.")
+    return create_client(settings["url"], settings["service_key"])
+
+
+def get_db_client(settings, access_token):
+    client = create_client(settings["url"], settings["anon_key"])
+    client.postgrest.auth(access_token)
+    return client
+
+
+def response_user(response):
+    user = getattr(response, "user", None)
+    session = getattr(response, "session", None)
+    if not user or not session:
+        return False
+    st.session_state["ag_user_id"] = str(user.id)
+    st.session_state["ag_email"] = str(getattr(user, "email", "") or "")
+    st.session_state["ag_access_token"] = session.access_token
+    st.session_state["ag_refresh_token"] = session.refresh_token
+    app_meta = getattr(user, "app_metadata", {}) or {}
+    st.session_state["ag_role"] = app_meta.get("role", "client")
+    return True
+
+
+def clear_login():
+    for key in ("ag_user_id", "ag_email", "ag_access_token", "ag_refresh_token", "ag_role", "ag_profile"):
+        st.session_state.pop(key, None)
+    st.session_state.pop("lancamentos", None)
+
+
+def load_profile(settings):
+    token = st.session_state.get("ag_access_token", "")
+    if not token:
+        return None
+    db = get_db_client(settings, token)
+    result = db.table("profiles").select("id,email,full_name,active").eq("id", st.session_state["ag_user_id"]).limit(1).execute()
+    profile = result.data[0] if result.data else None
+    st.session_state["ag_profile"] = profile
+    return profile
+
+
+def fetch_documents(settings):
+    db = get_db_client(settings, st.session_state["ag_access_token"])
+    result = db.table("documents").select("id,user_id,file_name,created_at,doc_type,producer,raw_data,status,observation").order("created_at", desc=True).execute()
+    records = []
+    for row in result.data or []:
+        try:
+            date_text = datetime.fromisoformat(row.get("created_at", "").replace("Z", "+00:00")).astimezone().strftime("%d/%m/%Y %H:%M:%S")
+        except Exception:
+            date_text = row.get("created_at", "")
+        records.append({
+            "id": row.get("id"),
+            "NomeFicheiro": row.get("file_name", ""),
+            "Data/Hora": date_text,
+            "Tipo Documento": row.get("doc_type", ""),
+            "ProdutorIdentificado": row.get("producer", ""),
+            "RawData": row.get("raw_data") or {},
+            "StatusAuditoria": row.get("status", ""),
+            "Observacao": row.get("observation", ""),
+        })
+    return records
+
+
+def save_document(settings, item):
+    db = get_db_client(settings, st.session_state["ag_access_token"])
+    payload = {
+        "user_id": st.session_state["ag_user_id"],
+        "file_name": item.get("NomeFicheiro", ""),
+        "doc_type": item.get("Tipo Documento", ""),
+        "producer": item.get("ProdutorIdentificado", ""),
+        "raw_data": item.get("RawData", {}),
+        "status": item.get("StatusAuditoria", ""),
+        "observation": item.get("Observacao", ""),
+    }
+    db.table("documents").insert(payload).execute()
+
+
+def delete_document(settings, doc_id):
+    db = get_db_client(settings, st.session_state["ag_access_token"])
+    db.table("documents").delete().eq("id", doc_id).execute()
+
+
+def show_login(settings, supabase):
+    st.title("🌾 AgroSmart")
+    st.subheader("Acesse sua conta")
+    login_tab, recover_tab = st.tabs(["Entrar", "Esqueci minha senha"])
+    with login_tab:
+        with st.form("login_form"):
+            email = st.text_input("E-mail", key="login_email").strip().lower()
+            password = st.text_input("Senha", type="password", key="login_password")
+            submitted = st.form_submit_button("Entrar", type="primary", use_container_width=True)
+        if submitted:
+            try:
+                response = supabase.auth.sign_in_with_password({"email": email, "password": password})
+                if response_user(response):
+                    st.rerun()
+                else:
+                    st.error("Não foi possível iniciar a sessão. Confirme seu e-mail e senha e verifique a confirmação do e-mail, se ativada.")
+            except Exception:
+                st.error("Não foi possível entrar. Verifique o e-mail e a senha ou tente novamente.")
+    with recover_tab:
+        st.write("Informe o e-mail cadastrado. Se a conta existir, você receberá um link para criar outra senha.")
+        with st.form("recover_form"):
+            recover_email = st.text_input("E-mail da conta", key="recover_email").strip().lower()
+            recover_submit = st.form_submit_button("Enviar link de recuperação", use_container_width=True)
+        if recover_submit:
+            if not settings.get("app_url"):
+                st.error("O administrador precisa configurar APP_URL nos Secrets do Streamlit Cloud.")
+            elif not recover_email:
+                st.warning("Informe o e-mail da conta.")
+            else:
+                try:
+                    supabase.auth.reset_password_for_email(
+                        recover_email,
+                        {"redirect_to": f"{settings['app_url']}/?mode=recovery"},
+                    )
+                    st.success("Se o e-mail estiver cadastrado, o link de recuperação será enviado.")
+                except Exception:
+                    st.success("Se o e-mail estiver cadastrado, o link de recuperação será enviado. Aguarde alguns minutos e confira o spam.")
+
+
+def admin_panel(settings):
+    st.subheader("🛡️ Administração de clientes")
+    if not settings.get("service_key"):
+        st.warning("A função administrativa exige SUPABASE_SERVICE_ROLE_KEY nos Secrets. Nunca compartilhe essa chave nem a coloque no GitHub.")
+        return
+    admin = get_admin_client(settings)
+    with st.expander("➕ Cadastrar novo cliente", expanded=False):
+        with st.form("create_client_form"):
+            full_name = st.text_input("Nome do cliente")
+            email = st.text_input("E-mail do cliente").strip().lower()
+            password = st.text_input("Senha inicial (mínimo de 10 caracteres)", type="password")
+            create = st.form_submit_button("Criar conta", type="primary")
+        if create:
+            if not full_name.strip() or not email or len(password) < 10:
+                st.error("Preencha o nome, o e-mail e uma senha com pelo menos 10 caracteres.")
+            else:
+                try:
+                    created = admin.auth.admin.create_user({
+                        "email": email,
+                        "password": password,
+                        "email_confirm": True,
+                        "user_metadata": {"full_name": full_name.strip()},
+                    })
+                    user = getattr(created, "user", None)
+                    if user is None:
+                        raise RuntimeError("O Supabase não retornou o usuário criado.")
+                    admin.table("profiles").upsert({
+                        "id": str(user.id), "email": email,
+                        "full_name": full_name.strip(), "active": True,
+                    }).execute()
+                    st.success(f"Conta criada para {email}. Entregue a senha inicial por um canal seguro e peça ao cliente para alterá-la.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Não foi possível criar a conta. Verifique se o e-mail já existe e se a chave administrativa está correta. Detalhe: {exc}")
+
+    st.markdown("**Clientes cadastrados**")
+    try:
+        result = admin.table("profiles").select("id,email,full_name,active,created_at").order("created_at", desc=True).execute()
+        profiles = result.data or []
+    except Exception as exc:
+        st.error(f"Não foi possível carregar a lista de clientes: {exc}")
+        return
+    if not profiles:
+        st.info("Ainda não há clientes cadastrados.")
+        return
+    for profile in profiles:
+        if profile["id"] == st.session_state["ag_user_id"]:
+            continue
+        cols = st.columns([3, 2, 1.3])
+        cols[0].write(f"**{profile.get('full_name') or 'Sem nome'}**\n\n{profile.get('email', '')}")
+        cols[1].write("Ativo" if profile.get("active", True) else "Bloqueado")
+        if profile.get("active", True):
+            if cols[2].button("Bloquear", key=f"block_{profile['id']}"):
+                try:
+                    admin.table("profiles").update({"active": False}).eq("id", profile["id"]).execute()
+                    # Ban at Auth level as a second layer; RLS also checks profile active.
+                    try:
+                        admin.auth.admin.update_user_by_id(profile["id"], {"ban_duration": "876000h"})
+                    except Exception:
+                        pass
+                    st.success("Acesso bloqueado.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Não foi possível bloquear a conta: {exc}")
+        else:
+            if cols[2].button("Reativar", key=f"unblock_{profile['id']}"):
+                try:
+                    admin.table("profiles").update({"active": True}).eq("id", profile["id"]).execute()
+                    try:
+                        admin.auth.admin.update_user_by_id(profile["id"], {"ban_duration": "none"})
+                    except Exception:
+                        pass
+                    st.success("Acesso reativado.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Não foi possível reativar a conta: {exc}")
+
+
+settings = get_settings()
+if not settings.get("url") or not settings.get("anon_key"):
+    st.title("🌾 AgroSmart")
+    st.error("Configure SUPABASE_URL e SUPABASE_ANON_KEY em Settings → Secrets no Streamlit Cloud.")
+    st.code('SUPABASE_URL = "https://SEU-PROJETO.supabase.co"\nSUPABASE_ANON_KEY = "SUA_CHAVE_ANON_PUBLIC"\nSUPABASE_SERVICE_ROLE_KEY = "SUA_CHAVE_SERVICE_ROLE"\nAPP_URL = "https://agrosmartfuturodoagro.streamlit.app"\nGOOGLE_API_KEY = "SUA_CHAVE_GEMINI_OPCIONAL"', language="toml")
+    st.stop()
+
+try:
+    supabase = get_auth_client(settings)
+except Exception:
+    st.title("🌾 AgroSmart")
+    st.error("Não foi possível conectar ao Supabase. Confira SUPABASE_URL e SUPABASE_ANON_KEY nos Secrets.")
+    st.stop()
+
+# Password-recovery callback. Prefer token_hash from the customized Supabase
+# recovery email template; also accept the standard PKCE ?code= callback.
+if st.query_params.get("mode") == "recovery" and st.query_params.get("token_hash"):
+    try:
+        callback_response = supabase.auth.verify_otp({
+            "token_hash": st.query_params.get("token_hash"),
+            "type": st.query_params.get("type", "recovery"),
+        })
+        response_user(callback_response)
+        st.session_state["ag_recovery_mode"] = True
+    except Exception:
+        st.session_state["ag_recovery_error"] = True
+elif st.query_params.get("mode") == "recovery" and st.query_params.get("code"):
+    try:
+        callback_code = st.query_params.get("code")
+        callback_response = supabase.auth.exchange_code_for_session({"auth_code": callback_code})
+        response_user(callback_response)
+        st.session_state["ag_recovery_mode"] = True
+    except Exception:
+        st.session_state["ag_recovery_error"] = True
+
+if st.session_state.get("ag_recovery_error"):
+    st.title("🌾 Recuperar senha")
+    st.error("O link de recuperação expirou ou não pôde ser validado. Solicite um novo link na tela de login.")
+    if st.button("Voltar ao login"):
+        st.session_state.pop("ag_recovery_error", None)
+        st.query_params.clear()
+        st.rerun()
+    st.stop()
+
+if st.session_state.get("ag_recovery_mode"):
+    st.title("🔐 Criar nova senha")
+    st.write("Escolha uma senha nova para sua conta.")
+    with st.form("new_password_form"):
+        new_password = st.text_input("Nova senha (mínimo de 10 caracteres)", type="password")
+        confirm_password = st.text_input("Confirme a nova senha", type="password")
+        change_password = st.form_submit_button("Salvar nova senha", type="primary")
+    if change_password:
+        if len(new_password) < 10:
+            st.error("A senha precisa ter pelo menos 10 caracteres.")
+        elif new_password != confirm_password:
+            st.error("As senhas não coincidem.")
+        else:
+            try:
+                supabase.auth.update_user({"password": new_password})
+                st.session_state.pop("ag_recovery_mode", None)
+                clear_login()
+                st.query_params.clear()
+                st.success("Senha atualizada. Entre com sua nova senha.")
+                st.rerun()
+            except Exception:
+                st.error("Não foi possível atualizar a senha. Solicite um novo link de recuperação e tente novamente.")
+    st.stop()
+
+if not st.session_state.get("ag_access_token"):
+    show_login(settings, supabase)
+    st.stop()
+
+# Refresh token/session if needed; session is kept in Streamlit session state.
+try:
+    if st.session_state.get("ag_refresh_token"):
+        refreshed = supabase.auth.set_session(
+            st.session_state["ag_access_token"], st.session_state["ag_refresh_token"]
+        )
+        session = getattr(refreshed, "session", None)
+        if session:
+            st.session_state["ag_access_token"] = session.access_token
+            st.session_state["ag_refresh_token"] = session.refresh_token
+except Exception:
+    clear_login()
+    st.warning("Sua sessão expirou. Entre novamente.")
     st.rerun()
 
-st.sidebar.markdown("---")
-tipo_doc = st.sidebar.selectbox(
-    "Categoria do Ficheiro a Enviar:",
-    [
-        "Nota Fiscal de Produtor (NFP-e)",
-        "Guia de Trânsito Animal (GTA)",
-        "Cadastro Ambiental Rural (CAR)"
-    ]
+try:
+    profile = load_profile(settings)
+except Exception:
+    profile = None
+if not profile:
+    clear_login()
+    st.error("Seu perfil não foi encontrado. Peça ao administrador para verificar seu cadastro.")
+    st.stop()
+if not profile.get("active", True):
+    clear_login()
+    st.error("Esta conta está bloqueada. Entre em contato com o administrador do AgroSmart.")
+    st.stop()
+
+is_admin = st.session_state.get("ag_role") == "admin"
+
+st.markdown(
+    """
+    <style>
+    .stApp { background: linear-gradient(135deg, #f4f6f0 0%, #e8efe2 100%); }
+    h1 { color: #1b4332 !important; font-weight: 700; }
+    h2, h3 { color: #2d6a4f !important; }
+    [data-testid="stSidebar"] { background-color: #d8f3dc; }
+    [data-testid="stFileUploader"] { background: #fff; padding: 12px; border-radius: 10px; border: 1px solid #b7e4c7; }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
-# 🎯 DEFINIÇÃO DINÂMICA DO TEXTO DO BOTÃO
-if "Nota" in tipo_doc:
-    texto_botao = "🚀 Validar NFP-e"
-elif "Guia" in tipo_doc:
-    texto_botao = "🚀 Validar GTA"
-else:
-    texto_botao = "🚀 Validar CAR"
+st.title("🌾 AgroSmart - Gestão de NFP-e, GTA & CAR")
+st.caption(f"Conta: {profile.get('full_name') or st.session_state.get('ag_email')} · {'Administrador' if is_admin else 'Cliente'}")
+with st.sidebar:
+    st.header("👤 Minha conta")
+    st.write(st.session_state.get("ag_email", ""))
+    if st.button("Sair", use_container_width=True):
+        try:
+            supabase.auth.sign_out()
+        except Exception:
+            pass
+        clear_login()
+        st.rerun()
+    st.divider()
+    st.header("⚙️ Configurações & Filtros")
+    doc_label = st.selectbox("Categoria do documento:", list(TIPOS_DOCUMENTO.keys()))
+    st.markdown("---")
+    st.subheader("🤖 Extração com IA (opcional)")
+    st.caption("Sem chave Gemini, o sistema tenta extrair texto de PDFs nativos. Para imagens ou PDFs digitalizados, configure a chave no Secrets.")
+    api_key = settings.get("google_key", "")
+    st.markdown("---")
+    status_filter = st.selectbox("Filtrar documentos:", ["Todos os registos", "Extração concluída", "Revisão necessária"])
+    if st.button("🔄 Atualizar lista", use_container_width=True):
+        st.rerun()
 
-# --- UPLOAD DE FICHEIROS ---
-st.subheader(f"📁 Carregar Lote: {tipo_doc}")
-uploaded_files = st.file_uploader(
-    f"Selecione documentos de {tipo_doc} (PDF, PNG, JPG):", 
-    type=["pdf", "png", "jpg", "jpeg"], 
-    accept_multiple_files=True
-)
+if is_admin:
+    with st.expander("🛡️ Painel do administrador", expanded=False):
+        admin_panel(settings)
 
-if uploaded_files:
-    st.info(f"📁 **{len(uploaded_files)} ficheiro(s)** carregado(s).")
-    
-    if st.button(texto_botao, type="primary"):
-        barra_progresso = st.progress(0)
-        status_texto = st.empty()
-        
-        sucessos = 0
-        total_files = len(uploaded_files)
-        client = None
-        
-        if usuario_autorizado_ia and api_key_input:
-            try:
-                client = genai.Client(api_key=api_key_input)
-            except Exception:
-                pass
-        
-        for idx, arquivo in enumerate(uploaded_files):
-            status_texto.text(f"A processar ({idx + 1}/{total_files}): {arquivo.name}...")
-            file_bytes = arquivo.getvalue()
-            dados = None
-            
-            if arquivo.name.lower().endswith(".pdf"):
-                dados = extrair_dados_pdf_nativo(file_bytes, tipo_doc)
-            
-            if not dados and usuario_autorizado_ia and client:
-                img_bytes, mime_tipo = comprimir_imagem(file_bytes)
-                if "Nota" in tipo_doc:
-                    prompt = 'Analise esta Nota Fiscal. Retorne um JSON puro com: "emitente_nome", "emitente_cpf_cnpj", "numero_nf", "valor_total_nota".'
-                elif "Guia" in tipo_doc:
-                    prompt = 'Analise esta GTA. Retorne um JSON puro com: "numero_gta", "emitente", "quantidade_cabecas".'
-                else:
-                    prompt = 'Analise este documento de CAR. Retorne um JSON puro com: "numero_car", "proprietario", "area_hectares", "status_car".'
-                
-                try:
-                    response = client.models.generate_content(
-                        model='gemini-2.5-flash',
-                        contents=[
-                            types.Part.from_bytes(data=img_bytes, mime_type=mime_tipo),
-                            prompt
-                        ],
-                        config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.0)
-                    )
-                    if response and response.text:
-                        dados = parse_json_safely(response.text)
-                except Exception:
-                    pass
-            
-            if not dados:
-                if "Nota" in tipo_doc:
-                    dados = {"emitente_nome": f"Produtor {arquivo.name}", "numero_nf": "9999", "valor_total_nota": "50000.00"}
-                elif "Guia" in tipo_doc:
-                    dados = {"numero_gta": "8888", "emitente": f"Produtor {arquivo.name}", "quantidade_cabecas": "50"}
-                else:
-                    dados = {"numero_car": "RO-000000-XXXX", "proprietario": f"Produtor {arquivo.name}", "area_hectares": "150.0", "status_car": "Ativo"}
-
-            if dados:
-                produtor_nome = dados.get("emitente_nome") or dados.get("emitente") or dados.get("proprietario") or "Produtor"
-                nome_atual = arquivo.name.strip().lower()
-                ja_existe = any(item.get("NomeFicheiro", "").strip().lower() == nome_atual for item in st.session_state.lancamentos)
-                
-                status_auditoria = "✅ Documento Validado e Integrado"
-                if ja_existe:
-                    status_auditoria = "⚠️ Alerta: Ficheiro Duplicado"
-                
-                st.session_state.lancamentos.append({
-                    "NomeFicheiro": arquivo.name,
-                    "Data/Hora": time.strftime("%d/%m/%Y %H:%M:%S"),
-                    "Tipo Documento": tipo_doc,
-                    "ProdutorIdentificado": produtor_nome,
-                    "RawData": dados,
-                    "StatusAuditoria": status_auditoria
-                })
-                sucessos += 1
-                
-            barra_progresso.progress((idx + 1) / total_files)
-
-        status_texto.empty()
-        barra_progresso.empty()
-        
-        if sucessos > 0:
-            st.success(f"🎉 Processamento concluído! **{sucessos} documento(s)** integrados.")
-            st.rerun()
+try:
+    records = fetch_documents(settings)
+except Exception as exc:
+    st.error("Não foi possível carregar os registros do banco. Confirme se executou o arquivo supabase_schema.sql no SQL Editor do Supabase.")
+    st.caption(str(exc))
+    st.stop()
 
 st.divider()
+doc_type = TIPOS_DOCUMENTO[doc_label]
+st.subheader(f"📁 Carregar documentos: {doc_label}")
+uploaded_files = st.file_uploader("Selecione um ou mais documentos (PDF, PNG ou JPG)", type=["pdf", "png", "jpg", "jpeg"], accept_multiple_files=True)
 
-# --- PAINEL DE GESTÃO COMPLETA ---
-st.subheader("📊 Painel Consolidado por Produtor (NFP, GTA & CAR)")
+if uploaded_files and st.button("🚀 Processar documentos", type="primary"):
+    client = get_gemini_client(api_key)
+    progress = st.progress(0)
+    status_box = st.empty()
+    added = 0
+    for index, uploaded in enumerate(uploaded_files):
+        status_box.write(f"Processando {index + 1}/{len(uploaded_files)}: {uploaded.name}")
+        file_bytes = uploaded.getvalue()
+        data = None
+        method = ""
+        if uploaded.name.lower().endswith(".pdf"):
+            pdf_text = extract_pdf_text(file_bytes)
+            if pdf_text:
+                data = extract_fields_from_text(pdf_text, doc_type)
+                if data:
+                    method = "Extraído do texto do PDF — confira os campos."
+        if not data and client:
+            data, error = extract_with_gemini(file_bytes, uploaded.name, doc_type, client)
+            if data:
+                method = "Extraído com Gemini — confira os campos."
+            else:
+                method = error or "Não foi possível extrair os dados."
+        if not data:
+            data = {}
+            method = method or "Nenhum dado extraído. Confira o tipo escolhido e, se necessário, configure o Gemini."
+        producer = data.get("emitente_nome") or data.get("emitente") or data.get("proprietario") or ""
+        status = "⚠️ Revisão necessária" if not any(str(v).strip() for v in data.values()) else "✅ Extração concluída"
+        item = {
+            "NomeFicheiro": uploaded.name,
+            "Data/Hora": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+            "Tipo Documento": doc_label,
+            "ProdutorIdentificado": producer,
+            "RawData": data,
+            "StatusAuditoria": status,
+            "Observacao": method,
+        }
+        try:
+            save_document(settings, item)
+            added += 1
+        except Exception as exc:
+            st.error(f"Não foi possível salvar {uploaded.name}. Nenhum registro foi confirmado no banco. Detalhe: {exc}")
+        progress.progress((index + 1) / len(uploaded_files))
+    status_box.empty()
+    progress.empty()
+    if added:
+        st.success(f"Processamento finalizado: {added} registro(s) salvo(s) na sua conta.")
+    st.rerun()
 
-if st.session_state.lancamentos:
-    # Aplicar Filtro de Status
-    lancamentos_filtrados = []
-    for item in st.session_state.lancamentos:
-        st_audit = item.get("StatusAuditoria", "")
-        if filtro_status == "✅ Apenas Válidos / Regulares" and "✅" not in st_audit:
-            continue
-        if filtro_status == "⚠️ Apenas Alertas / Duplicados" and "⚠️" not in st_audit:
-            continue
-        lancamentos_filtrados.append(item)
+# Reload after processing; database RLS enforces tenant separation.
+try:
+    records = fetch_documents(settings)
+except Exception as exc:
+    st.error(f"Falha ao carregar os registros: {exc}")
+    st.stop()
 
-    if not lancamentos_filtrados:
-        st.warning(f"⚠️ Nenhum documento encontrado com o filtro selecionado: **{filtro_status}**")
-    else:
-        produtores_map = {}
-        for item in lancamentos_filtrados:
-            p_nome = item.get("ProdutorIdentificado", "Produtor Geral")
-            if p_nome not in produtores_map:
-                produtores_map[p_nome] = []
-            produtores_map[p_nome].append(item)
-
-        col_m1, col_m2 = st.columns(2)
-        with col_m1:
-            st.metric("Produtores / Fazendas Exibidas", len(produtores_map))
-        with col_m2:
-            st.metric("Documentos Filtrados", len(lancamentos_filtrados))
-
-        st.markdown("---")
-
-        for produtor, docs in produtores_map.items():
-            st.markdown(f"### 🚜 Fazenda / Produtor: **{produtor}**")
-            
-            tabela_produtor = []
-            nfs_p = sum(1 for d in docs if "Nota" in d.get("Tipo Documento", ""))
-            gtas_p = sum(1 for d in docs if "Guia" in d.get("Tipo Documento", ""))
-            car_p = sum(1 for d in docs if "Cadastro" in d.get("Tipo Documento", ""))
-
-            for d in docs:
-                raw = d.get("RawData", {})
-                t_doc = d.get("Tipo Documento", "")
-                if "Nota" in t_doc:
-                    ident = raw.get("numero_nf")
-                    detalhe = f"R$ {raw.get('valor_total_nota')}"
-                elif "Guia" in t_doc:
-                    ident = raw.get("numero_gta")
-                    detalhe = f"{raw.get('quantidade_cabecas')} cabeças"
-                else:
-                    ident = raw.get("numero_car")
-                    detalhe = f"Área: {raw.get('area_hectares')} ha ({raw.get('status_car')})"
-                
-                tabela_produtor.append({
-                    "Ficheiro": d.get("NomeFicheiro"),
-                    "Tipo": t_doc,
-                    "Identificador": ident or "N/A",
-                    "Detalhes / Especificação": detalhe,
-                    "Status": d.get("StatusAuditoria")
-                })
-
-            st.dataframe(tabela_produtor, use_container_width=True)
-            st.caption(f"📌 Resumo visível: {nfs_p} Nota(s) | {gtas_p} GTA(s) | {car_p} CAR(s).")
-            st.markdown("<br>", unsafe_allow_html=True)
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        if st.button("🗑️ Limpar Todos os Registos"):
-            st.session_state.lancamentos = []
-            st.rerun()
-    with col2:
-        excel_file = gerar_excel_por_tipo(st.session_state.lancamentos)
-        st.download_button(
-            label="📥 Baixar Excel Completo (.xlsx)",
-            data=excel_file,
-            file_name=f"Relatorio_AgroSmart_{time.strftime('%Y%m%d_%H%M')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary"
-        )
-    with col3:
-        txt_data = gerar_txt_dominio(st.session_state.lancamentos)
-        st.download_button(
-            label="📄 Baixar Layout Domínio (.txt)",
-            data=txt_data,
-            file_name=f"Importacao_Dominio_{time.strftime('%Y%m%d_%H%M')}.txt",
-            mime="text/plain",
-            type="primary"
-        )
+if status_filter == "Extração concluída":
+    visible = [r for r in records if "Extração concluída" in r.get("StatusAuditoria", "")]
+elif status_filter == "Revisão necessária":
+    visible = [r for r in records if "Revisão necessária" in r.get("StatusAuditoria", "")]
 else:
-    st.info("💡 Clica no botão **'⚡ Injetar Lote Completo (Fazenda)'** na barra lateral para testar a união entre Notas Fiscais, GTAs e o CAR do produtor!")
+    visible = records
+
+st.divider()
+st.subheader("📊 Painel consolidado")
+if not visible:
+    st.info("Nenhum registro nesta conta para mostrar. Carregue um documento para começar.")
+else:
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Documentos exibidos", len(visible))
+    col2.metric("Extrações concluídas", sum("Extração concluída" in r.get("StatusAuditoria", "") for r in visible))
+    col3.metric("Precisam de revisão", sum("Revisão necessária" in r.get("StatusAuditoria", "") for r in visible))
+    table_rows = []
+    for item in visible:
+        ident, detail = format_doc_summary(item)
+        table_rows.append({
+            "Arquivo": item.get("NomeFicheiro", ""),
+            "Produtor / Fazenda": item.get("ProdutorIdentificado", "") or "Não identificado",
+            "Tipo": item.get("Tipo Documento", ""),
+            "Identificador": ident or "Não identificado",
+            "Detalhes": detail or "Não identificado",
+            "Status": item.get("StatusAuditoria", ""),
+        })
+    st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
+    with st.expander("Ver dados extraídos e observações"):
+        for item in visible:
+            st.markdown(f"**{item.get('NomeFicheiro', '')}**")
+            st.caption(item.get("Observacao", ""))
+            st.json(item.get("RawData", {}))
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.download_button("📥 Baixar relatório Excel", data=make_excel(visible), file_name=f"Relatorio_AgroSmart_{datetime.now():%Y%m%d_%H%M}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary", use_container_width=True)
+    with col_b:
+        st.download_button("📄 Baixar layout Domínio (.txt)", data=make_domain_txt(visible), file_name=f"Importacao_Dominio_{datetime.now():%Y%m%d_%H%M}.txt", mime="text/plain", use_container_width=True)
+
+st.caption("Importante: a extração automática pode errar. Confira os dados nos documentos originais antes de usar para decisões fiscais, sanitárias ou ambientais.")
