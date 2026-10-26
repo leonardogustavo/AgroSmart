@@ -1,18 +1,22 @@
-import streamlit as st
+import streamlit as str
+import pandas as pd
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+import pdfplumber
+import json
+import time
+import io
+import re
+from PIL import Image
 
-# Bloco de segurança para garantir que pacotes essenciais carregam sem erros no Streamlit Cloud
+# Importação segura do Gemini
 try:
-    import openpyxl
-    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from google import genai
 except ImportError:
-    st.error("⚠️ A biblioteca 'openpyxl' não foi encontrada. A verificar dependências...")
-
-try:
-    import pdfplumber
-except ImportError:
-    pass
-
-try:
+    try:
+        import google.generativeai as genai
+    except ImportError:
+        genai = None
     import pandas as pd
 except ImportError:
     pass
