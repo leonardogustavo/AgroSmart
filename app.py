@@ -765,6 +765,7 @@ else:
         table_rows.append({
             "Arquivo": item.get("NomeFicheiro", ""),
             "Produtor / Fazenda": item.get("ProdutorIdentificado", "") or "Não identificado",
+            "CPF/CNPJ": (item.get("RawData") or {}).get("emitente_cpf_cnpj", "") or "Não identificado",
             "Tipo": item.get("Tipo Documento", ""),
             "Identificador": ident or "Não identificado",
             "Detalhes": detail or "Não identificado",
