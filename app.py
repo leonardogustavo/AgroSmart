@@ -380,45 +380,80 @@ def delete_document(settings, doc_id):
     db.table("documents").delete().eq("id", doc_id).execute()
 
 
+
 def show_login(settings, supabase):
     st.title("🌾 AgroSmart")
     st.subheader("Acesse sua conta")
     login_tab, recover_tab = st.tabs(["Entrar", "Esqueci minha senha"])
+
     with login_tab:
         with st.form("login_form"):
             email = st.text_input("E-mail", key="login_email").strip().lower()
-            password = st.text_input("Senha", type="password", key="login_password")
-            submitted = st.form_submit_button("Entrar", type="primary", use_container_width=True)
+            password = st.text_input("Senha", type="password")
+            submitted = st.form_submit_button(
+                "Entrar", type="primary", use_container_width=True
+            )
+
         if submitted:
             try:
-                response = supabase.auth.sign_in_with_password({"email": email, "password": password})
+                response = supabase.auth.sign_in_with_password(
+                    {"email": email, "password": password}
+                )
                 if response_user(response):
                     st.rerun()
                 else:
-                    st.error("Não foi possível iniciar a sessão. Confirme seu e-mail e senha e verifique a confirmação do e-mail, se ativada.")
+                    st.error(
+                        "Não foi possível iniciar a sessão. Confirme seu e-mail "
+                        "e senha e verifique a confirmação do e-mail, se ativada."
+                    )
             except Exception:
-                st.error("Não foi possível entrar. Verifique o e-mail e a senha ou tente novamente.")
+                st.error(
+                    "Não foi possível entrar. Verifique o e-mail e a senha "
+                    "ou tente novamente."
+                )
+
     with recover_tab:
-        st.write("Informe o e-mail cadastrado. Se a conta existir, você receberá um link para criar outra senha.")
+        st.write(
+            "Informe o e-mail cadastrado. Se a conta existir, "
+            "você receberá um link para criar outra senha."
+        )
+
         with st.form("recover_form"):
-            recover_email = st.text_input("E-mail da conta", key="recover_email").strip().lower()
-            recover_submit = st.form_submit_button("Enviar link de recuperação", use_container_width=True)
-                if recover_submit:
+            recover_email = st.text_input(
+                "E-mail da conta", key="recover_email"
+            ).strip().lower()
+            recover_submit = st.form_submit_button(
+                "Enviar link de recuperação",
+                use_container_width=True,
+            )
+
+        if recover_submit:
             if not settings.get("app_url"):
-                st.error("O administrador precisa configurar APP_URL nos Secrets do Streamlit Cloud.")
+                st.error(
+                    "O administrador precisa configurar APP_URL "
+                    "nos Secrets do Streamlit Cloud."
+                )
             elif not recover_email:
                 st.warning("Informe o e-mail da conta.")
             else:
                 try:
                     supabase.auth.reset_password_for_email(
                         recover_email,
-                        {"redirect_to": f"{settings['app_url']}/?mode=recovery"},
+                        {
+                            "redirect_to": (
+                                f"{settings['app_url']}/?mode=recovery"
+                            )
+                        },
                     )
                     st.success(
-                        "Se o e-mail estiver cadastrado, o link de recuperação será enviado."
+                        "Se o e-mail estiver cadastrado, o link de "
+                        "recuperação será enviado."
                     )
                 except Exception as exc:
-                    st.error(f"Erro ao solicitar recuperação: {exc}")
+                    st.error(
+                        f"Erro ao solicitar recuperação: {exc}"
+                    )
+
 
 def admin_panel(settings):
     st.subheader("🛡️ Administração de clientes")
