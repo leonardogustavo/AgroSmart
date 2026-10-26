@@ -1,4 +1,5 @@
 import io
+import hashlib
 import json
 import re
 import time
@@ -300,6 +301,52 @@ def format_doc_summary(item):
     return raw.get("numero_car", ""), f"{raw.get('area_hectares', '')} ha".strip()
 
 
+def calculate_file_hash(file_bytes):
+    """Stable SHA-256 fingerprint for an uploaded file's exact bytes."""
+    return hashlib.sha256(file_bytes).hexdigest()
+
+
+def normalize_identifier(value):
+    return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+
+
+def document_signature(doc_type, raw_data):
+    """Identify the same business document across re-exports/re-scans when possible.
+
+    This is a secondary check for older records that predate the file_hash column.
+    It deliberately requires identifying fields to reduce false-positive matches.
+    """
+    raw = raw_data if isinstance(raw_data, dict) else {}
+
+    if "Nota" in str(doc_type):
+        number = normalize_identifier(raw.get("numero_nf"))
+        tax_id = normalize_identifier(raw.get("emitente_cpf_cnpj"))
+        issuer = normalize_identifier(raw.get("emitente_nome"))
+        if number and (tax_id or issuer):
+            return ("nota", number, tax_id or issuer)
+
+    elif "Guia" in str(doc_type):
+        number = normalize_identifier(raw.get("numero_gta"))
+        tax_id = normalize_identifier(raw.get("emitente_cpf_cnpj"))
+        issuer = normalize_identifier(raw.get("emitente"))
+        if number and (tax_id or issuer):
+            return ("gta", number, tax_id or issuer)
+
+    elif "CAR" in str(doc_type):
+        car_number = normalize_identifier(raw.get("numero_car"))
+        if car_number:
+            return ("car", car_number)
+
+    return None
+
+
+def find_semantic_duplicate(records_by_signature, doc_type, raw_data):
+    signature = document_signature(doc_type, raw_data)
+    if signature is None:
+        return None
+    return records_by_signature.get(signature)
+
+
 def make_excel(records):
     wb = Workbook()
     ws = wb.active
@@ -444,7 +491,7 @@ def load_profile(settings):
 
 def fetch_documents(settings):
     db = get_db_client(settings, st.session_state["ag_access_token"])
-    result = db.table("documents").select("id,user_id,file_name,created_at,doc_type,producer,raw_data,status,observation").order("created_at", desc=True).execute()
+    result = db.table("documents").select("id,user_id,file_name,created_at,doc_type,producer,raw_data,status,observation,file_hash").order("created_at", desc=True).execute()
     records = []
     for row in result.data or []:
         try:
@@ -460,6 +507,7 @@ def fetch_documents(settings):
             "RawData": row.get("raw_data") or {},
             "StatusAuditoria": row.get("status", ""),
             "Observacao": row.get("observation", ""),
+            "FileHash": row.get("file_hash") or "",
         })
     return records
 
@@ -474,6 +522,7 @@ def save_document(settings, item):
         "raw_data": item.get("RawData", {}),
         "status": item.get("StatusAuditoria", ""),
         "observation": item.get("Observacao", ""),
+        "file_hash": item.get("FileHash", ""),
     }
     db.table("documents").insert(payload).execute()
 
@@ -775,12 +824,57 @@ if uploaded_files and st.button("🚀 Processar documentos", type="primary"):
     progress = st.progress(0)
     status_box = st.empty()
     added = 0
+    skipped_duplicates = []
+    errors = []
+
+    # Hashes and document identifiers already saved for this logged-in user.
+    existing_by_hash = {
+        item.get("FileHash"): item
+        for item in records
+        if item.get("FileHash")
+    }
+    semantic_records = {}
+    for item in records:
+        signature = document_signature(
+            item.get("Tipo Documento", ""), item.get("RawData") or {}
+        )
+        if signature and signature not in semantic_records:
+            semantic_records[signature] = item
+
+    seen_upload_hashes = {}
+
     for index, uploaded in enumerate(uploaded_files):
-        status_box.write(f"Processando {index + 1}/{len(uploaded_files)}: {uploaded.name}")
+        status_box.write(
+            f"Verificando {index + 1}/{len(uploaded_files)}: {uploaded.name}"
+        )
         file_bytes = uploaded.getvalue()
+        file_hash = calculate_file_hash(file_bytes)
+
+        # Exact duplicate already saved (works for records processed after this update).
+        existing_match = existing_by_hash.get(file_hash)
+        if existing_match:
+            skipped_duplicates.append(
+                f"{uploaded.name}: arquivo idêntico já cadastrado como "
+                f"'{existing_match.get('NomeFicheiro', 'sem nome')}'."
+            )
+            progress.progress((index + 1) / len(uploaded_files))
+            continue
+
+        # Exact duplicate within this multi-file selection.
+        previous_upload_name = seen_upload_hashes.get(file_hash)
+        if previous_upload_name:
+            skipped_duplicates.append(
+                f"{uploaded.name}: é uma cópia idêntica de '{previous_upload_name}' "
+                "nesta mesma seleção."
+            )
+            progress.progress((index + 1) / len(uploaded_files))
+            continue
+        seen_upload_hashes[file_hash] = uploaded.name
+
+        is_xml = uploaded.name.lower().endswith(".xml")
         data = None
         method = ""
-        is_xml = uploaded.name.lower().endswith(".xml")
+
         if is_xml:
             data, error = extract_fields_from_xml(file_bytes, doc_type)
             if data:
@@ -793,17 +887,47 @@ if uploaded_files and st.button("🚀 Processar documentos", type="primary"):
                 data = extract_fields_from_text(pdf_text, doc_type)
                 if data:
                     method = "Extraído do texto do PDF — confira os campos."
+
         if not data and client and not is_xml:
-            data, error = extract_with_gemini(file_bytes, uploaded.name, doc_type, client)
+            data, error = extract_with_gemini(
+                file_bytes, uploaded.name, doc_type, client
+            )
             if data:
                 method = "Extraído com Gemini — confira os campos."
             else:
                 method = error or "Não foi possível extrair os dados."
+
         if not data:
             data = {}
-            method = method or "Nenhum dado extraído. Confira o tipo escolhido e, se necessário, configure o Gemini."
-        producer = data.get("emitente_nome") or data.get("emitente") or data.get("proprietario") or ""
-        status = "⚠️ Revisão necessária" if not any(str(v).strip() for v in data.values()) else "✅ Extração concluída"
+            method = method or (
+                "Nenhum dado extraído. Confira o tipo escolhido e, "
+                "se necessário, configure o Gemini."
+            )
+
+        # Secondary semantic duplicate check also helps for older records that
+        # were saved before the file_hash column existed, and for re-scanned PDFs.
+        signature = document_signature(doc_label, data)
+        semantic_match = semantic_records.get(signature) if signature else None
+        if semantic_match:
+            skipped_duplicates.append(
+                f"{uploaded.name}: parece ser o mesmo documento já cadastrado como "
+                f"'{semantic_match.get('NomeFicheiro', 'sem nome')}' "
+                "(mesmo identificador e emitente)."
+            )
+            progress.progress((index + 1) / len(uploaded_files))
+            continue
+
+        producer = (
+            data.get("emitente_nome")
+            or data.get("emitente")
+            or data.get("proprietario")
+            or ""
+        )
+        status = (
+            "⚠️ Revisão necessária"
+            if not any(str(value).strip() for value in data.values())
+            else "✅ Extração concluída"
+        )
         item = {
             "NomeFicheiro": uploaded.name,
             "Data/Hora": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
@@ -812,18 +936,35 @@ if uploaded_files and st.button("🚀 Processar documentos", type="primary"):
             "RawData": data,
             "StatusAuditoria": status,
             "Observacao": method,
+            "FileHash": file_hash,
         }
+
         try:
             save_document(settings, item)
             added += 1
+            existing_by_hash[file_hash] = item
+            if signature:
+                semantic_records[signature] = item
         except Exception as exc:
-            st.error(f"Não foi possível salvar {uploaded.name}. Nenhum registro foi confirmado no banco. Detalhe: {exc}")
+            errors.append(f"{uploaded.name}: {exc}")
+
         progress.progress((index + 1) / len(uploaded_files))
+
     status_box.empty()
     progress.empty()
+
     if added:
-        st.success(f"Processamento finalizado: {added} registro(s) salvo(s) na sua conta.")
-    st.rerun()
+        st.success(f"Processamento concluído: {added} documento(s) novo(s) salvo(s).")
+    if skipped_duplicates:
+        st.warning(
+            "Nenhum registro duplicado foi criado. Os seguintes arquivos foram ignorados:\n\n"
+            + "\n\n".join(f"- {message}" for message in skipped_duplicates)
+        )
+    if errors:
+        st.error(
+            "Alguns arquivos não puderam ser salvos:\n\n"
+            + "\n\n".join(f"- {message}" for message in errors)
+        )
 
 # Reload after processing; database RLS enforces tenant separation.
 try:
@@ -841,6 +982,12 @@ else:
 
 st.divider()
 st.subheader("📊 Painel consolidado")
+delete_flash = st.session_state.pop("_agrosmart_delete_flash", None)
+if delete_flash:
+    st.success(delete_flash)
+delete_error_flash = st.session_state.pop("_agrosmart_delete_error_flash", None)
+if delete_error_flash:
+    st.error(delete_error_flash)
 if not visible:
     st.info("Nenhum registro nesta conta para mostrar. Carregue um documento para começar.")
 else:
@@ -862,32 +1009,63 @@ else:
         })
     st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
 
-    st.subheader("🗑️ Remover documento")
-    selected_doc = st.selectbox(
-        "Selecione o documento que deseja excluir:",
-        options=visible,
-        format_func=lambda item: (
-            f"{item.get('NomeFicheiro', 'Sem nome')} — "
-            f"{item.get('Data/Hora', '')} — "
-            f"{item.get('Tipo Documento', '')}"
-        ),
-        key="doc_to_delete",
-    )
-    confirm_delete = st.checkbox(
-        f"Confirmo a exclusão do documento {selected_doc.get('NomeFicheiro', '')}",
-        key=f"confirm_delete_{selected_doc['id']}",
-    )
-    if st.button(
-        "🗑️ Excluir documento selecionado",
-        disabled=not confirm_delete,
-        key=f"delete_{selected_doc['id']}",
-    ):
-        try:
-            delete_document(settings, selected_doc["id"])
-            st.success("Documento excluído com sucesso!")
+    with st.expander("🗑️ Remover documentos", expanded=False):
+        st.caption(
+            "Selecione um ou vários registros para excluir. A exclusão remove "
+            "permanentemente os registros e dados extraídos do banco."
+        )
+        delete_options = {}
+        for record in visible:
+            record_id = str(record.get("id", ""))
+            label = (
+                f"{record.get('NomeFicheiro', 'Sem nome')} — "
+                f"{record.get('Data/Hora', '')} — "
+                f"{record.get('Tipo Documento', '')} — ID {record_id[:8]}"
+            )
+            delete_options[label] = record.get("id")
+
+        selected_delete_labels = st.multiselect(
+            "Selecione os documentos a remover",
+            options=list(delete_options.keys()),
+            key="selected_documents_to_delete",
+            placeholder="Escolha um ou mais documentos...",
+        )
+        selected_delete_ids = [
+            delete_options[label] for label in selected_delete_labels
+        ]
+        selected_ids_key = hashlib.sha256(
+            "|".join(sorted(str(value) for value in selected_delete_ids)).encode("utf-8")
+        ).hexdigest()[:12]
+        confirm_delete = st.checkbox(
+            f"Confirmo a exclusão permanente de {len(selected_delete_ids)} registro(s).",
+            key=f"confirm_delete_{selected_ids_key}",
+            disabled=not selected_delete_ids,
+        )
+
+        if st.button(
+            "🗑️ Excluir documentos selecionados",
+            disabled=not selected_delete_ids or not confirm_delete,
+            key="delete_selected_documents_button",
+        ):
+            deleted = 0
+            delete_errors = []
+            for doc_id in selected_delete_ids:
+                try:
+                    delete_document(settings, doc_id)
+                    deleted += 1
+                except Exception as exc:
+                    delete_errors.append(str(exc))
+
+            if deleted:
+                st.session_state["_agrosmart_delete_flash"] = (
+                    f"{deleted} documento(s) removido(s) com sucesso."
+                )
+            if delete_errors:
+                st.session_state["_agrosmart_delete_error_flash"] = (
+                    "Alguns registros não puderam ser removidos: "
+                    + "; ".join(delete_errors)
+                )
             st.rerun()
-        except Exception as exc:
-            st.error(f"Não foi possível excluir o documento: {exc}")
 
     with st.expander("Ver dados extraídos e observações"):
         for item in visible:
