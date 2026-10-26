@@ -335,7 +335,7 @@ def make_domain_txt(records):
                 f"{raw.get('numero_nf', '')}|{value}|CNPJ|{cnpj}"
             )
 
-               elif "Guia" in doc_type:
+        elif "Guia" in doc_type:
             cpf_cnpj = str(raw.get("emitente_cpf_cnpj", ""))
 
             lines.append(
