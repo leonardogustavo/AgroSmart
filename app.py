@@ -201,29 +201,29 @@ def extract_with_gemini(file_bytes, filename, doc_type, client):
         return None, f"Falha na análise por IA: {exc}"
 
 
+
 def format_doc_summary(item):
-    raw = item.get("RawData", {})
+    raw = item.get("RawData") or {}
     doc_type = item.get("Tipo Documento", "")
+
     if "Nota" in doc_type:
-        return raw.get("numero_nf", ""), f"R$ {raw.get('valor_total_nota', '')}".strip()
+        return (
+            raw.get("numero_nf", ""),
+            f"R$ {raw.get('valor_total_nota', '')}".strip(),
+        )
+
     if "Guia" in doc_type:
-        return raw.get("numero_gta", ""), f"{raw.get('quantidade_cabecas', '')} cabeças".strip()
-    return raw.get("numero_car", ""), f"{raw.get('area_hectares', '')} ha".strip()
+        return (
+            raw.get("numero_gta", ""),
+            f"{raw.get('quantidade_cabecas', '')} cabeças".strip(),
+        )
+
+    return (
+        raw.get("numero_car", ""),
+        f"{raw.get('area_hectares', '')} ha".strip(),
+    )
 
 
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "AgroSmart"
-        headers = [
-        "Arquivo", "Data/Hora", "Produtor / Fazenda", "CPF/CNPJ",
-        "Tipo Documento", "Identificador", "Detalhes", "Status",
-        "Dados extraídos (JSON)"
-    ]
-    ws.append(headers)
-    header_fill = PatternFill("solid", fgColor="1B4332")
-    header_font = Font(bold=True, color="FFFFFF")
-    thin = Side(style=
 def make_excel(records):
     wb = Workbook()
     ws = wb.active
@@ -255,7 +255,10 @@ def make_excel(records):
             wrap_text=True,
         )
         cell.border = Border(
-            left=thin, right=thin, top=thin, bottom=thin
+            left=thin,
+            right=thin,
+            top=thin,
+            bottom=thin,
         )
 
     for item in records:
@@ -277,13 +280,18 @@ def make_excel(records):
     for row in ws.iter_rows(min_row=2):
         for cell in row:
             cell.border = Border(
-                left=thin, right=thin, top=thin, bottom=thin
+                left=thin,
+                right=thin,
+                top=thin,
+                bottom=thin,
             )
             cell.alignment = Alignment(
-                vertical="top", wrap_text=True
+                vertical="top",
+                wrap_text=True,
             )
 
     widths = [28, 20, 32, 22, 34, 22, 26, 42, 70]
+
     for index, width in enumerate(widths, start=1):
         ws.column_dimensions[
             ws.cell(row=1, column=index).column_letter
@@ -295,8 +303,8 @@ def make_excel(records):
     output = io.BytesIO()
     wb.save(output)
     output.seek(0)
-    return output.getvalue()
 
+    return output.getvalue()
 
 
 def make_domain_txt(records):
@@ -308,7 +316,10 @@ def make_domain_txt(records):
         producer = str(item.get("ProdutorIdentificado", ""))
 
         if "Nota" in doc_type:
-            value = str(raw.get("valor_total_nota", "")).replace(".", "").replace(",", "")
+            value = str(
+                raw.get("valor_total_nota", "")
+            ).replace(".", "").replace(",", "")
+
             cnpj = str(raw.get("emitente_cpf_cnpj", ""))
 
             lines.append(
@@ -330,7 +341,6 @@ def make_domain_txt(records):
             )
 
     return "\n".join(lines)
-
 
 # ---------------------------
 # Supabase authentication + persistence
