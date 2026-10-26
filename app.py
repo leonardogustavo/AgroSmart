@@ -113,6 +113,7 @@ def extract_fields_from_text(text, doc_type):
                 r"(?:Valor Total da Nota|Valor Total|Total da Nota)\s*[:R$\s]*([0-9.]+,[0-9]{2}|[0-9]+\.[0-9]{2})",
             ]),
         }
+    
     elif doc_type == "gta":
         data = {
             "numero_gta": first([
@@ -121,6 +122,11 @@ def extract_fields_from_text(text, doc_type):
             "emitente": first([
                 r"(?:Produtor|Propriet[aá]rio|Emitente|Nome do produtor)\s*[:\-]?\s*([^\n]+)",
             ]),
+            "emitente_cpf_cnpj": first([
+                r"(?:CPF\s*/\s*CNPJ|CPF/CNPJ|CNPJ|CPF)\s*(?:do\s+)?(?:emitente|produtor|propriet[aá]rio|respons[aá]vel)?\s*[:\-]?\s*(\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}|\d{3}\.?\d{3}\.?\d{3}-?\d{2})",
+                r"(\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2})",
+                r"(\d{3}\.?\d{3}\.?\d{3}-\d{2})",
+            ]),
             "quantidade_cabecas": first([
                 r"(?:Quantidade de animais|Quantidade|N[ºo°]\s*de animais|Total de animais)\s*[:\-]?\s*([0-9]+)",
             ]),
@@ -128,6 +134,7 @@ def extract_fields_from_text(text, doc_type):
                 r"(?:Munic[ií]pio de destino|Destino)\s*[:\-]?\s*([^\n]+)",
             ]),
         }
+
     else:
         data = {
             "numero_car": first([
@@ -166,9 +173,10 @@ def extract_with_gemini(file_bytes, filename, doc_type, client):
             'as chaves "emitente_nome", "emitente_cpf_cnpj", "numero_nf", "valor_total_nota". '
             'Se um campo não estiver legível ou não existir, use string vazia. Não invente dados.'
         ),
-        "gta": (
+               "gta": (
             'Extraia os dados desta Guia de Trânsito Animal (GTA). Retorne apenas JSON válido com '
-            'as chaves "numero_gta", "emitente", "quantidade_cabecas", "destino_uf_municipio". '
+            'as chaves "numero_gta", "emitente", "emitente_cpf_cnpj", '
+            '"quantidade_cabecas", "destino_uf_municipio". '
             'Se um campo não estiver legível ou não existir, use string vazia. Não invente dados.'
         ),
         "car": (
@@ -327,11 +335,14 @@ def make_domain_txt(records):
                 f"{raw.get('numero_nf', '')}|{value}|CNPJ|{cnpj}"
             )
 
-        elif "Guia" in doc_type:
+               elif "Guia" in doc_type:
+            cpf_cnpj = str(raw.get("emitente_cpf_cnpj", ""))
+
             lines.append(
                 f"DOMINIO_GTA|{producer}|GTA|"
                 f"{raw.get('numero_gta', '')}|"
-                f"{raw.get('quantidade_cabecas', '')}"
+                f"{raw.get('quantidade_cabecas', '')}|"
+                f"CPF_CNPJ|{cpf_cnpj}"
             )
 
         else:
