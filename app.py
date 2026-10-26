@@ -1,5 +1,5 @@
 import streamlit as st
-import google.generativeai as genai
+import streamlit as st
 import json
 import time
 import io
@@ -9,6 +9,15 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from PIL import Image
 import pdfplumber
 
+# Importação segura do Gemini (tenta a biblioteca nova ou a clássica sem rebentar a app)
+try:
+    from google import genai
+except ImportError:
+    try:
+        import google.generativeai as genai
+    except ImportError:
+        genai = None
+        st.error("⚠️ Atenção: Nenhuma biblioteca do Google GenAI foi encontrada no ambiente.")
 # Configuração da página
 st.set_page_config(
     page_title="AgroSmart - Gestão de NFP-e, GTA & CAR",
