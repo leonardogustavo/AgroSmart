@@ -777,14 +777,13 @@ with st.sidebar:
         clear_login()
         st.rerun()
     st.divider()
-    st.header("⚙️ Configurações & Filtros")
+    st.header("⚙️ Configurações")
     doc_label = st.selectbox("Categoria do documento:", list(TIPOS_DOCUMENTO.keys()))
     st.markdown("---")
     st.subheader("🤖 Extração com IA (opcional)")
     st.caption("Sem chave Gemini, o sistema tenta extrair texto de PDFs nativos. Para imagens ou PDFs digitalizados, configure a chave no Secrets.")
     api_key = settings.get("google_key", "")
     st.markdown("---")
-    status_filter = st.selectbox("Filtrar documentos:", ["Todos os registos", "Extração concluída", "Revisão necessária"])
     if st.button("🔄 Atualizar lista", use_container_width=True):
         st.rerun()
 
@@ -973,12 +972,8 @@ except Exception as exc:
     st.error(f"Falha ao carregar os registros: {exc}")
     st.stop()
 
-if status_filter == "Extração concluída":
-    visible = [r for r in records if "Extração concluída" in r.get("StatusAuditoria", "")]
-elif status_filter == "Revisão necessária":
-    visible = [r for r in records if "Revisão necessária" in r.get("StatusAuditoria", "")]
-else:
-    visible = records
+# Exibe todos os documentos, sem filtro por status.
+visible = records
 
 st.divider()
 st.subheader("📊 Painel consolidado")
