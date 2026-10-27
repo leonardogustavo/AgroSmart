@@ -57,6 +57,10 @@ TIPOS_DOCUMENTO = {
 }
 
 
+STORAGE_BUCKET = "agrosmart-documents"
+MAX_UPLOAD_MB = 50
+
+
 def parse_json_safely(text):
     """Extract a JSON object from a model response."""
     if not text:
@@ -491,15 +495,26 @@ def load_profile(settings):
 
 def fetch_documents(settings):
     db = get_db_client(settings, st.session_state["ag_access_token"])
-    result = db.table("documents").select("id,user_id,file_name,created_at,doc_type,producer,raw_data,status,observation,file_hash").order("created_at", desc=True).execute()
+    result = (
+        db.table("documents")
+        .select(
+            "id,user_id,file_name,created_at,doc_type,producer,raw_data,status,"
+            "observation,file_hash,storage_path,storage_bucket,mime_type,file_size"
+        )
+        .order("created_at", desc=True)
+        .execute()
+    )
     records = []
     for row in result.data or []:
         try:
-            date_text = datetime.fromisoformat(row.get("created_at", "").replace("Z", "+00:00")).astimezone().strftime("%d/%m/%Y %H:%M:%S")
+            date_text = datetime.fromisoformat(
+                row.get("created_at", "").replace("Z", "+00:00")
+            ).astimezone().strftime("%d/%m/%Y %H:%M:%S")
         except Exception:
             date_text = row.get("created_at", "")
         records.append({
             "id": row.get("id"),
+            "user_id": row.get("user_id"),
             "NomeFicheiro": row.get("file_name", ""),
             "Data/Hora": date_text,
             "Tipo Documento": row.get("doc_type", ""),
@@ -508,26 +523,198 @@ def fetch_documents(settings):
             "StatusAuditoria": row.get("status", ""),
             "Observacao": row.get("observation", ""),
             "FileHash": row.get("file_hash") or "",
+            "StoragePath": row.get("storage_path") or "",
+            "StorageBucket": row.get("storage_bucket") or STORAGE_BUCKET,
+            "MimeType": row.get("mime_type") or "application/octet-stream",
+            "FileSize": row.get("file_size"),
         })
     return records
 
 
-def save_document(settings, item):
+def get_file_mime_type(filename):
+    extension = str(filename or "").lower().rsplit(".", 1)[-1]
+    return {
+        "pdf": "application/pdf",
+        "xml": "application/xml",
+        "png": "image/png",
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+    }.get(extension, "application/octet-stream")
+
+
+def make_storage_path(user_id, file_hash, filename):
+    # Keep the first folder equal to the authenticated user ID for Storage RLS.
+    basename = str(filename or "documento").replace("\\", "/").split("/")[-1]
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", basename).strip("._")
+    safe_name = (safe_name or "documento")[:100]
+    return f"{user_id}/{file_hash}_{safe_name}"
+
+
+def _get_authorized_document(settings, doc_id):
+    """Load a document through the current user's RLS-protected DB client."""
+    db = get_db_client(settings, st.session_state["ag_access_token"])
+    result = (
+        db.table("documents")
+        .select("id,user_id,file_name,storage_path,storage_bucket,mime_type,file_size")
+        .eq("id", doc_id)
+        .limit(1)
+        .execute()
+    )
+    rows = result.data or []
+    if not rows:
+        raise PermissionError("Documento não encontrado ou sem permissão de acesso.")
+
+    row = rows[0]
+    current_user_id = str(st.session_state.get("ag_user_id", ""))
+    is_admin = st.session_state.get("ag_role") == "admin"
+    if str(row.get("user_id", "")) != current_user_id and not is_admin:
+        raise PermissionError("Você não tem permissão para acessar este documento.")
+    return row
+
+
+def create_document_download_url(settings, doc_id):
+    """Return a short-lived signed URL after checking row access under user RLS."""
+    row = _get_authorized_document(settings, doc_id)
+    storage_path = row.get("storage_path")
+    if not storage_path:
+        raise FileNotFoundError(
+            "Este registro é anterior ao Arquivo Digital e não possui o original guardado. "
+            "Envie o arquivo novamente para armazená-lo."
+        )
+
+    admin = get_admin_client(settings)
+    bucket = row.get("storage_bucket") or STORAGE_BUCKET
+    response = admin.storage.from_(bucket).create_signed_url(
+        storage_path,
+        300,
+        {"download": True},
+    )
+    signed_url = (
+        response.get("signedURL")
+        or response.get("signedUrl")
+        or response.get("signed_url")
+    ) if isinstance(response, dict) else None
+    if not signed_url:
+        raise RuntimeError("O Supabase não retornou o link temporário para download.")
+
+    # Some SDK versions return a path; others return the fully qualified URL.
+    if signed_url.startswith("/"):
+        signed_url = f"{settings['url'].rstrip('/')}/storage/v1{signed_url}"
+    elif not signed_url.startswith("http://") and not signed_url.startswith("https://"):
+        signed_url = f"{settings['url'].rstrip('/')}/storage/v1/{signed_url.lstrip('/')}"
+    return signed_url
+
+
+def save_document(settings, item, file_bytes):
+    """Upload original into private Storage, then save metadata; clean up on DB failure."""
+    user_id = str(st.session_state["ag_user_id"])
+    file_hash = item.get("FileHash") or calculate_file_hash(file_bytes)
+    storage_path = make_storage_path(user_id, file_hash, item.get("NomeFicheiro", ""))
+    mime_type = get_file_mime_type(item.get("NomeFicheiro", ""))
+    admin = get_admin_client(settings)
+
+    # The service-role key stays on the Streamlit server; never put it in GitHub.
+    # App code verifies ownership before downloads and deletes; Storage is private.
+    admin.storage.from_(STORAGE_BUCKET).upload(
+        path=storage_path,
+        file=file_bytes,
+        file_options={
+            "content-type": mime_type,
+            "cache-control": "3600",
+            "upsert": "false",
+        },
+    )
+
     db = get_db_client(settings, st.session_state["ag_access_token"])
     payload = {
-        "user_id": st.session_state["ag_user_id"],
+        "user_id": user_id,
         "file_name": item.get("NomeFicheiro", ""),
         "doc_type": item.get("Tipo Documento", ""),
         "producer": item.get("ProdutorIdentificado", ""),
         "raw_data": item.get("RawData", {}),
         "status": item.get("StatusAuditoria", ""),
         "observation": item.get("Observacao", ""),
-        "file_hash": item.get("FileHash", ""),
+        "file_hash": file_hash,
+        "storage_bucket": STORAGE_BUCKET,
+        "storage_path": storage_path,
+        "mime_type": mime_type,
+        "file_size": len(file_bytes),
+        "storage_uploaded_at": datetime.now().astimezone().isoformat(),
     }
-    db.table("documents").insert(payload).execute()
+    try:
+        db.table("documents").insert(payload).execute()
+    except Exception:
+        # Avoid leaving an orphaned object when inserting the metadata fails.
+        try:
+            admin.storage.from_(STORAGE_BUCKET).remove([storage_path])
+        except Exception:
+            pass
+        raise
+
+
+def archive_original_for_existing_document(settings, existing_item, file_bytes):
+    """Backfill an old row without a stored original when the exact same bytes are reuploaded."""
+    current_user_id = str(st.session_state.get("ag_user_id", ""))
+    row_user_id = str(existing_item.get("user_id", ""))
+    is_admin = st.session_state.get("ag_role") == "admin"
+    if row_user_id != current_user_id and not is_admin:
+        raise PermissionError("Você não tem permissão para arquivar o original deste registro.")
+    if existing_item.get("StoragePath"):
+        return
+
+    file_hash = existing_item.get("FileHash") or calculate_file_hash(file_bytes)
+    storage_path = make_storage_path(
+        row_user_id,
+        file_hash,
+        existing_item.get("NomeFicheiro", "documento"),
+    )
+    mime_type = get_file_mime_type(existing_item.get("NomeFicheiro", ""))
+    admin = get_admin_client(settings)
+
+    admin.storage.from_(STORAGE_BUCKET).upload(
+        path=storage_path,
+        file=file_bytes,
+        file_options={
+            "content-type": mime_type,
+            "cache-control": "3600",
+            "upsert": "false",
+        },
+    )
+    try:
+        # The record was first found via the user's RLS-protected query. The service
+        # role is used only server-side here to update the attachment metadata.
+        admin.table("documents").update({
+            "storage_bucket": STORAGE_BUCKET,
+            "storage_path": storage_path,
+            "mime_type": mime_type,
+            "file_size": len(file_bytes),
+            "storage_uploaded_at": datetime.now().astimezone().isoformat(),
+        }).eq("id", existing_item.get("id")).eq("user_id", row_user_id).execute()
+    except Exception:
+        try:
+            admin.storage.from_(STORAGE_BUCKET).remove([storage_path])
+        except Exception:
+            pass
+        raise
+
+    existing_item["StoragePath"] = storage_path
+    existing_item["StorageBucket"] = STORAGE_BUCKET
+    existing_item["MimeType"] = mime_type
+    existing_item["FileSize"] = len(file_bytes)
 
 
 def delete_document(settings, doc_id):
+    """Remove the private original and then the metadata after checking access."""
+    row = _get_authorized_document(settings, doc_id)
+    admin = get_admin_client(settings)
+    bucket = row.get("storage_bucket") or STORAGE_BUCKET
+    storage_path = row.get("storage_path")
+
+    # Delete the object first. If Storage fails, keep the database record so the
+    # user can retry instead of silently losing the reference to the original.
+    if storage_path:
+        admin.storage.from_(bucket).remove([storage_path])
+
     db = get_db_client(settings, st.session_state["ag_access_token"])
     db.table("documents").delete().eq("id", doc_id).execute()
 
@@ -802,10 +989,12 @@ st.divider()
 doc_type = TIPOS_DOCUMENTO[doc_label]
 st.subheader(f"📁 Carregar documentos: {doc_label}")
 uploaded_files = st.file_uploader(
-    "Selecione documentos PDF, XML fiscal, PNG ou JPG",
+    "Selecione documentos PDF, XML fiscal, PNG ou JPG (até 50 MB por arquivo)",
     type=["pdf", "xml", "png", "jpg", "jpeg"],
     accept_multiple_files=True,
+    max_upload_size=MAX_UPLOAD_MB,
 )
+st.caption("Os novos arquivos serão guardados em armazenamento privado. Registros antigos não têm o original; para arquivá-los, envie o arquivo novamente.")
 
 if uploaded_files:
     for xml_upload in uploaded_files:
@@ -852,10 +1041,26 @@ if uploaded_files and st.button("🚀 Processar documentos", type="primary"):
         # Exact duplicate already saved (works for records processed after this update).
         existing_match = existing_by_hash.get(file_hash)
         if existing_match:
-            skipped_duplicates.append(
-                f"{uploaded.name}: arquivo idêntico já cadastrado como "
-                f"'{existing_match.get('NomeFicheiro', 'sem nome')}'."
-            )
+            if not existing_match.get("StoragePath"):
+                try:
+                    archive_original_for_existing_document(
+                        settings, existing_match, file_bytes
+                    )
+                    skipped_duplicates.append(
+                        f"{uploaded.name}: já estava cadastrado como "
+                        f"'{existing_match.get('NomeFicheiro', 'sem nome')}'; "
+                        "o original foi arquivado no registro existente."
+                    )
+                except Exception as exc:
+                    errors.append(
+                        f"{uploaded.name}: foi reconhecido como duplicado, "
+                        f"mas não foi possível arquivar o original: {exc}"
+                    )
+            else:
+                skipped_duplicates.append(
+                    f"{uploaded.name}: arquivo idêntico já cadastrado como "
+                    f"'{existing_match.get('NomeFicheiro', 'sem nome')}'."
+                )
             progress.progress((index + 1) / len(uploaded_files))
             continue
 
@@ -939,7 +1144,7 @@ if uploaded_files and st.button("🚀 Processar documentos", type="primary"):
         }
 
         try:
-            save_document(settings, item)
+            save_document(settings, item, file_bytes)
             added += 1
             existing_by_hash[file_hash] = item
             if signature:
@@ -993,13 +1198,14 @@ else:
     # Lista de documentos com ação de exclusão ao lado de cada registro.
     # A exclusão só ocorre após uma confirmação explícita daquele documento.
     st.markdown("**Documentos da sua conta**")
-    header_cols = st.columns([2.6, 1.25, 1.55, 2.0, 1.65, 1.05])
+    header_cols = st.columns([2.25, 1.1, 1.45, 1.8, 1.45, 1.15, 0.9])
     header_cols[0].markdown("**Arquivo**")
     header_cols[1].markdown("**Tipo**")
     header_cols[2].markdown("**Data / hora**")
     header_cols[3].markdown("**Produtor / Fazenda**")
     header_cols[4].markdown("**Status**")
-    header_cols[5].markdown("**Ação**")
+    header_cols[5].markdown("**Original**")
+    header_cols[6].markdown("**Ação**")
 
     pending_delete_id = str(
         st.session_state.get("agrosmart_pending_delete_id", "")
@@ -1007,7 +1213,7 @@ else:
 
     for item in visible:
         record_id = str(item.get("id") or "")
-        row_cols = st.columns([2.6, 1.25, 1.55, 2.0, 1.65, 1.05])
+        row_cols = st.columns([2.25, 1.1, 1.45, 1.8, 1.45, 1.15, 0.9])
         row_cols[0].write(item.get("NomeFicheiro", "Sem nome"))
         row_cols[1].write(item.get("Tipo Documento", ""))
         row_cols[2].write(item.get("Data/Hora", ""))
@@ -1016,10 +1222,42 @@ else:
         )
         row_cols[4].write(item.get("StatusAuditoria", ""))
 
-        if row_cols[5].button(
+        # Generate short-lived signed URLs only when the user requests a download.
+        # Existing rows saved before Storage was enabled have no StoragePath.
+        if item.get("StoragePath"):
+            url_key = f"agrosmart_original_url_{record_id}"
+            created_key = f"agrosmart_original_url_created_{record_id}"
+            cached_url = st.session_state.get(url_key)
+            created_at = float(st.session_state.get(created_key, 0) or 0)
+            if cached_url and (time.time() - created_at) < 240:
+                row_cols[5].link_button(
+                    "📥 Baixar",
+                    cached_url,
+                    key=f"open_original_{record_id}",
+                    help="Link privado temporário, válido por até 5 minutos.",
+                    use_container_width=True,
+                )
+            elif row_cols[5].button(
+                "🔗 Gerar link",
+                key=f"request_original_{record_id}",
+                help="Gerar um link temporário para baixar o arquivo original.",
+                use_container_width=True,
+            ):
+                try:
+                    st.session_state[url_key] = create_document_download_url(
+                        settings, item.get("id")
+                    )
+                    st.session_state[created_key] = time.time()
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Não foi possível disponibilizar o arquivo original: {exc}")
+        else:
+            row_cols[5].caption("Sem original")
+
+        if row_cols[6].button(
             "🗑️ Excluir",
             key=f"request_delete_{record_id}",
-            help="Solicitar exclusão deste documento",
+            help="Solicitar exclusão deste documento e do arquivo original",
             use_container_width=True,
         ):
             st.session_state["agrosmart_pending_delete_id"] = record_id
@@ -1039,8 +1277,10 @@ else:
                 try:
                     delete_document(settings, item.get("id"))
                     st.session_state.pop("agrosmart_pending_delete_id", None)
+                    st.session_state.pop(f"agrosmart_original_url_{record_id}", None)
+                    st.session_state.pop(f"agrosmart_original_url_created_{record_id}", None)
                     st.session_state["_agrosmart_delete_flash"] = (
-                        f"Documento '{item.get('NomeFicheiro', '')}' removido com sucesso."
+                        f"Documento e arquivo original '{item.get('NomeFicheiro', '')}' removidos com sucesso."
                     )
                     st.rerun()
                 except Exception as exc:
