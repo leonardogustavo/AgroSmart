@@ -555,7 +555,7 @@ def _get_authorized_document(settings, doc_id):
     db = get_db_client(settings, st.session_state["ag_access_token"])
     result = (
         db.table("documents")
-        .select("id,user_id,file_name,storage_path,storage_bucket,mime_type,file_size")
+        .select("id,user_id,file_name,file_hash,storage_path,storage_bucket,mime_type,file_size")
         .eq("id", doc_id)
         .limit(1)
         .execute()
@@ -572,6 +572,31 @@ def _get_authorized_document(settings, doc_id):
     return row
 
 
+def _validate_document_storage_location(row):
+    """Allow privileged Storage operations only on this app's bucket and owner's folder."""
+    owner_id = str(row.get("user_id") or "")
+    bucket = str(row.get("storage_bucket") or STORAGE_BUCKET)
+    storage_path = str(row.get("storage_path") or "")
+    file_hash = str(row.get("file_hash") or "")
+
+    if bucket != STORAGE_BUCKET:
+        raise PermissionError("Bucket do documento inválido.")
+    if not owner_id or not storage_path:
+        raise FileNotFoundError("O registro não possui caminho de arquivo válido.")
+
+    # Storage paths created by AgroSmart must be: <user_uuid>/<sha256>_<safe_filename>
+    parts = storage_path.split("/")
+    if len(parts) != 2 or parts[0] != owner_id:
+        raise PermissionError("O caminho do arquivo não corresponde ao proprietário do documento.")
+    if not re.fullmatch(r"[0-9a-f]{64}_[A-Za-z0-9._-]+", parts[1]):
+        raise PermissionError("O caminho do arquivo não corresponde ao padrão do AgroSmart.")
+    path_hash = parts[1].split("_", 1)[0]
+    if file_hash and path_hash != file_hash:
+        raise PermissionError("A impressão digital do arquivo não corresponde ao registro.")
+
+    return STORAGE_BUCKET, storage_path
+
+
 def create_document_download_url(settings, doc_id):
     """Return a short-lived signed URL after checking row access under user RLS."""
     row = _get_authorized_document(settings, doc_id)
@@ -582,8 +607,8 @@ def create_document_download_url(settings, doc_id):
             "Envie o arquivo novamente para armazená-lo."
         )
 
+    bucket, storage_path = _validate_document_storage_location(row)
     admin = get_admin_client(settings)
-    bucket = row.get("storage_bucket") or STORAGE_BUCKET
     response = admin.storage.from_(bucket).create_signed_url(
         storage_path,
         300,
@@ -707,12 +732,12 @@ def delete_document(settings, doc_id):
     """Remove the private original and then the metadata after checking access."""
     row = _get_authorized_document(settings, doc_id)
     admin = get_admin_client(settings)
-    bucket = row.get("storage_bucket") or STORAGE_BUCKET
     storage_path = row.get("storage_path")
 
-    # Delete the object first. If Storage fails, keep the database record so the
-    # user can retry instead of silently losing the reference to the original.
+    # Delete the object first. Validate its bucket and owner folder before using
+    # the privileged server-side client, which bypasses Storage RLS.
     if storage_path:
+        bucket, storage_path = _validate_document_storage_location(row)
         admin.storage.from_(bucket).remove([storage_path])
 
     db = get_db_client(settings, st.session_state["ag_access_token"])
