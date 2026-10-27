@@ -875,26 +875,70 @@ except Exception:
     st.error("Não foi possível conectar ao Supabase. Confira SUPABASE_URL e SUPABASE_ANON_KEY nos Secrets.")
     st.stop()
 
-# Password-recovery callback. Prefer token_hash from the customized Supabase
-# recovery email template; also accept the standard PKCE ?code= callback.
-if st.query_params.get("mode") == "recovery" and st.query_params.get("token_hash"):
-    try:
-        callback_response = supabase.auth.verify_otp({
-            "token_hash": st.query_params.get("token_hash"),
-            "type": st.query_params.get("type", "recovery"),
-        })
-        response_user(callback_response)
-        st.session_state["ag_recovery_mode"] = True
-    except Exception:
-        st.session_state["ag_recovery_error"] = True
-elif st.query_params.get("mode") == "recovery" and st.query_params.get("code"):
-    try:
-        callback_code = st.query_params.get("code")
-        callback_response = supabase.auth.exchange_code_for_session({"auth_code": callback_code})
-        response_user(callback_response)
-        st.session_state["ag_recovery_mode"] = True
-    except Exception:
-        st.session_state["ag_recovery_error"] = True
+
+# Password-recovery callback: validate each one-time credential only once.
+_recovery_mode = st.query_params.get("mode") == "recovery"
+_recovery_token_hash = st.query_params.get("token_hash")
+_recovery_code = st.query_params.get("code")
+
+if _recovery_mode and _recovery_token_hash:
+    _recovery_credential = f"token_hash:{_recovery_token_hash}"
+
+    if (
+        st.session_state.get("_ag_processed_recovery_credential")
+        != _recovery_credential
+    ):
+        try:
+            callback_response = supabase.auth.verify_otp({
+                "token_hash": _recovery_token_hash,
+                "type": st.query_params.get("type", "recovery"),
+            })
+
+            if not response_user(callback_response):
+                raise RuntimeError(
+                    "A validação não retornou uma sessão autenticada."
+                )
+
+            st.session_state["_ag_processed_recovery_credential"] = (
+                _recovery_credential
+            )
+            st.session_state["ag_recovery_mode"] = True
+            st.session_state.pop("ag_recovery_error", None)
+
+            # Remove the one-time token from the URL after successful validation.
+            st.query_params.clear()
+
+        except Exception:
+            st.session_state["ag_recovery_error"] = True
+
+elif _recovery_mode and _recovery_code:
+    _recovery_credential = f"code:{_recovery_code}"
+
+    if (
+        st.session_state.get("_ag_processed_recovery_credential")
+        != _recovery_credential
+    ):
+        try:
+            callback_response = supabase.auth.exchange_code_for_session({
+                "auth_code": _recovery_code
+            })
+
+            if not response_user(callback_response):
+                raise RuntimeError(
+                    "A troca do código não retornou uma sessão autenticada."
+                )
+
+            st.session_state["_ag_processed_recovery_credential"] = (
+                _recovery_credential
+            )
+            st.session_state["ag_recovery_mode"] = True
+            st.session_state.pop("ag_recovery_error", None)
+
+            # Remove the one-time code from the URL after successful validation.
+            st.query_params.clear()
+
+        except Exception:
+            st.session_state["ag_recovery_error"] = True
 
 if st.session_state.get("ag_recovery_error"):
     st.title("🌾 Recuperar senha")
